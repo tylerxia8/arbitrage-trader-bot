@@ -1,0 +1,41 @@
+# --- Private planning documents (never commit; this repo is public) ---
+*.docx
+*.doc
+*.pdf
+/docs/private/
+
+# --- Secrets & credentials ---
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+credentials.json
+secrets/
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+dist/
+build/
+
+# --- Data (raw market archives are large and may be license-restricted) ---
+data/
+*.db
+*.sqlite3
+*.parquet
+*.jsonl.gz
+
+# --- OS / editor ---
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
