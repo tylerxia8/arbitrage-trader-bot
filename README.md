@@ -53,10 +53,47 @@ These are release blockers, not preferences:
 
 Milestones ship in order. Each exit gate is a checkpoint, not a formality.
 
-## Planned stack
+## Getting started
+
+Requires [uv](https://docs.astral.sh/uv/) — it provisions Python 3.12 itself,
+so no system Python is needed. Docker is optional, for PostgreSQL.
+
+```bash
+make setup          # or:  .\scripts\dev.ps1 setup
+make check          # or:  .\scripts\dev.ps1 check    -- lint, types, FR-002, tests
+```
+
+`make check` runs everything CI runs and needs no database. For migrations:
+
+```bash
+make up             # start PostgreSQL
+cp .env.example .env
+make migrate        # alembic upgrade head
+arbbot doctor       # what is this deployment allowed to do?
+```
+
+`arbbot doctor` prints both standing execution gates, the environment, and the
+risk limits. It is the one-command answer to "is this thing armed" — and at
+Milestone 0 the answer is always no, because the live path is not compiled in.
+
+## Layout
+
+| Path | Contents |
+|---|---|
+| [src/arbbot/money.py](src/arbbot/money.py) | Fixed-point primitives; conservative rounding |
+| [src/arbbot/config.py](src/arbbot/config.py) | Validated settings, risk limits, live gates |
+| [src/arbbot/buildflags.py](src/arbbot/buildflags.py) | Compile-time capability flags (not env-readable) |
+| [src/arbbot/states.py](src/arbbot/states.py) | Order intent state machine |
+| [src/arbbot/reasons.py](src/arbbot/reasons.py) | Closed rejection-reason catalog |
+| [src/arbbot/db/](src/arbbot/db/) | Models: raw archive, markets, terms, registry, audit |
+| [tools/check_no_float.py](tools/check_no_float.py) | FR-002 static enforcement |
+| [docs/adr/](docs/adr/) | Architecture decision records |
+| [docs/threat-model.md](docs/threat-model.md) | Threat model |
+
+## Stack
 
 Python 3.12 · asyncio/httpx · Pydantic · PostgreSQL · SQLAlchemy/Alembic ·
-FastAPI · OpenTelemetry · Docker Compose · pytest · Hypothesis · Ruff · mypy
+FastAPI · Docker Compose · pytest · Hypothesis · Ruff · mypy (strict)
 
 ## Disclaimer
 

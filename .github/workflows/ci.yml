@@ -1,0 +1,170 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  UV_VERSION: "0.9.9"
+
+jobs:
+  quality:
+    name: Lint, types, and tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: astral-sh/setup-uv@v7
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+
+      - name: Install
+        run: |
+          uv venv --python 3.12
+          uv pip install -e ".[dev]"
+
+      - name: Ruff (lint)
+        run: .venv/bin/ruff check --output-format=github .
+
+      - name: Ruff (format)
+        run: .venv/bin/ruff format --check .
+
+      - name: mypy (strict)
+        run: .venv/bin/python -m mypy
+
+      - name: FR-002 -- no float in the money path
+        run: .venv/bin/python tools/check_no_float.py
+
+      - name: Tests
+        run: .venv/bin/python -m pytest --cov --cov-report=term-missing --cov-report=xml
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coverage
+          path: coverage.xml
+          if-no-files-found: ignore
+
+  migrations:
+    name: Migrations apply, reverse, and match the models
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: arbbot
+          POSTGRES_PASSWORD: arbbot
+          POSTGRES_DB: arbbot
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U arbbot -d arbbot"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 20
+    env:
+      ARBBOT_ENVIRONMENT: local
+      ARBBOT_DATABASE_URL: postgresql+psycopg://arbbot:arbbot@localhost:5432/arbbot
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: astral-sh/setup-uv@v7
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+
+      - name: Install
+        run: |
+          uv venv --python 3.12
+          uv pip install -e ".[dev]"
+
+      - name: Upgrade to head
+        run: .venv/bin/alembic upgrade head
+
+      - name: Models and schema agree
+        # Catches the migration drifting from the models -- the failure that
+        # otherwise surfaces as a production INSERT against a missing column.
+        run: .venv/bin/alembic check
+
+      - name: Append-only triggers reject mutation
+        # The immutability of the raw archive is a claim the schema makes.
+        # Verify it here rather than trusting the trigger was created.
+        run: |
+          set -euo pipefail
+          PGPASSWORD=arbbot psql -h localhost -U arbbot -d arbbot -v ON_ERROR_STOP=1 -c "
+            INSERT INTO raw_message (venue, channel, payload, sha256, schema_version)
+            VALUES ('test', 'test', '{}'::jsonb, repeat('a', 64), 'v1');"
+          if PGPASSWORD=arbbot psql -h localhost -U arbbot -d arbbot -v ON_ERROR_STOP=1 \
+              -c "UPDATE raw_message SET venue = 'tampered';" 2>/dev/null; then
+            echo "::error::raw_message accepted an UPDATE; the append-only trigger is not working"
+            exit 1
+          fi
+          if PGPASSWORD=arbbot psql -h localhost -U arbbot -d arbbot -v ON_ERROR_STOP=1 \
+              -c "DELETE FROM raw_message;" 2>/dev/null; then
+            echo "::error::raw_message accepted a DELETE; the append-only trigger is not working"
+            exit 1
+          fi
+          echo "raw_message correctly rejected UPDATE and DELETE"
+
+      - name: Downgrade to base
+        # An unreversible migration is a migration that cannot be rolled back
+        # during an incident.
+        run: .venv/bin/alembic downgrade base
+
+  security:
+    name: Secrets and dependencies
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0  # gitleaks scans history, not just the tip
+
+      - name: Secret scan
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: astral-sh/setup-uv@v7
+        with:
+          version: ${{ env.UV_VERSION }}
+
+      - name: Dependency audit
+        run: |
+          uv venv --python 3.12
+          uv pip install -e "." pip-audit
+          .venv/bin/pip-audit --strict --desc
+
+  build:
+    name: Container builds
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          load: true
+          tags: arbbot:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Image ships disarmed
+        # A release build must never contain an armed execution path.
+        # This is the last place to catch a build flag flipped by accident.
+        run: |
+          docker run --rm --entrypoint python arbbot:ci -c "
+          from arbbot import buildflags
+          assert buildflags.LIVE_EXECUTION_COMPILED_IN is False, 'live execution is compiled in'
+          assert buildflags.DEMO_EXECUTION_COMPILED_IN is False, 'demo execution is compiled in'
+          print('build flags: disarmed')
+          "

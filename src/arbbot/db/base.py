@@ -1,0 +1,55 @@
+"""Declarative base and shared column types.
+
+The naming convention matters: without it, Alembic autogenerate produces
+migrations with database-assigned constraint names that differ between
+environments, and a later ``DROP CONSTRAINT`` silently targets nothing. Naming
+every constraint deterministically keeps migrations reproducible, which is a
+precondition for the replay guarantee (NFR-03).
+"""
+
+from __future__ import annotations
+
+import datetime as dt
+from decimal import Decimal
+from typing import Annotated, Any
+
+from sqlalchemy import JSON, DateTime, MetaData, Numeric, String
+from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.orm import DeclarativeBase, mapped_column, registry
+
+__all__ = ["Base", "Json", "Money", "Sha256", "Timestamp"]
+
+NAMING_CONVENTION = {
+    "ix": "ix_%(column_0_label)s",
+    "uq": "uq_%(table_name)s_%(column_0_name)s",
+    "ck": "ck_%(table_name)s_%(constraint_name)s",
+    "fk": "fk_%(table_name)s_%(column_0_name)s_%(referred_table_name)s",
+    "pk": "pk_%(table_name)s",
+}
+
+#: Timezone-aware timestamp. Naive datetimes are banned project-wide (ruff DTZ)
+#: because a market close time is meaningless without its zone.
+Timestamp = Annotated[dt.datetime, mapped_column(DateTime(timezone=True))]
+
+#: Exact money. NUMERIC(18, 8) holds sub-cent fee arithmetic without loss.
+#: DOUBLE PRECISION is prohibited here for the same reason float is prohibited
+#: in Python -- see :mod:`arbbot.money`.
+Money = Annotated[Decimal, mapped_column(Numeric(18, 8))]
+
+#: Hex-encoded SHA-256 of an immutable payload or a normalized terms document.
+Sha256 = Annotated[str, mapped_column(String(64))]
+
+#: JSONB on PostgreSQL, plain JSON on SQLite fixtures.
+Json = Annotated[dict[str, Any], mapped_column(JSON().with_variant(JSONB, "postgresql"))]
+
+
+class Base(DeclarativeBase):
+    """Declarative base for every table in the system."""
+
+    registry = registry(
+        type_annotation_map={
+            dt.datetime: DateTime(timezone=True),
+            Decimal: Numeric(18, 8),
+        }
+    )
+    metadata = MetaData(naming_convention=NAMING_CONVENTION)

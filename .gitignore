@@ -23,9 +23,11 @@ venv/
 .mypy_cache/
 .ruff_cache/
 .coverage
+coverage.xml
 htmlcov/
 dist/
 build/
+.hypothesis/
 
 # --- Data (raw market archives are large and may be license-restricted) ---
 data/

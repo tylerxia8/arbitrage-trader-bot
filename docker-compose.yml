@@ -1,0 +1,47 @@
+name: arbbot
+
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: arbbot
+      POSTGRES_PASSWORD: arbbot
+      POSTGRES_DB: arbbot
+    ports:
+      # Published on 55432, well clear of the 5432/5433 range that local
+      # PostgreSQL installs claim. When a host server already holds the port,
+      # the published mapping is shadowed and connections land on the wrong
+      # server -- which surfaces as a password failure rather than a refused
+      # connection, and costs an hour to diagnose. Override with ARBBOT_DB_PORT.
+      - "${ARBBOT_DB_PORT:-55432}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      # The app waits for this rather than sleeping: a collector that starts
+      # before the database is accepting connections drops its first messages,
+      # and a gap in the raw archive is not recoverable after the fact.
+      test: ["CMD-SHELL", "pg_isready -U arbbot -d arbbot"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  app:
+    build:
+      context: .
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      ARBBOT_ENVIRONMENT: local
+      ARBBOT_DATABASE_URL: postgresql+psycopg://arbbot:arbbot@db:5432/arbbot
+      ARBBOT_LOG_LEVEL: INFO
+    # No venue credentials are passed. Local and research deployments use
+    # public endpoints only, and the config layer rejects a credential in
+    # those environments (see arbbot.config).
+    command: ["arbbot", "doctor"]
+    volumes:
+      - ./src:/app/src:ro
+      - ./alembic:/app/alembic:ro
+
+volumes:
+  pgdata:
