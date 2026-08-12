@@ -138,13 +138,15 @@ jobs:
           version: ${{ env.UV_VERSION }}
 
       - name: Dependency audit
-        # --skip-editable excludes arbbot itself: it is not published to PyPI,
-        # and without this --strict fails on "could not be audited" for our own
-        # package rather than on an actual vulnerability.
+        # Audit the resolved dependency tree rather than an installed
+        # environment. arbbot is not published to PyPI, so any run that
+        # includes it fails --strict on our own package instead of on a real
+        # vulnerability -- and --skip-editable does not help, because --strict
+        # treats a skipped package as an error too. Compiling first sidesteps
+        # both: the lock contains only third-party packages, fully resolved.
         run: |
-          uv venv --python 3.12
-          uv pip install -e "." pip-audit
-          .venv/bin/pip-audit --strict --desc --skip-editable
+          uv pip compile pyproject.toml -o requirements.lock.txt
+          uvx --from pip-audit pip-audit --strict --desc -r requirements.lock.txt
 
   build:
     name: Container builds
