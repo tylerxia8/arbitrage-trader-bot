@@ -138,10 +138,13 @@ jobs:
           version: ${{ env.UV_VERSION }}
 
       - name: Dependency audit
+        # --skip-editable excludes arbbot itself: it is not published to PyPI,
+        # and without this --strict fails on "could not be audited" for our own
+        # package rather than on an actual vulnerability.
         run: |
           uv venv --python 3.12
           uv pip install -e "." pip-audit
-          .venv/bin/pip-audit --strict --desc
+          .venv/bin/pip-audit --strict --desc --skip-editable
 
   build:
     name: Container builds
