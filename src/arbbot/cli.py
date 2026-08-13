@@ -173,6 +173,32 @@ def _serve(host: str, port: int) -> int:
     return 0
 
 
+def _baskets(max_age_seconds: float, limit: int) -> int:
+    """Report moments when a full leg set priced below its payout.
+
+    Research, not detection: no relationship here is approved, fees are
+    unmodelled, and only the best price level is used.
+    """
+    import datetime as dt
+
+    from arbbot.analysis.baskets import scan_baskets
+    from arbbot.db.session import session_factory
+
+    try:
+        settings = load_settings()
+    except ValidationError as exc:
+        print("configuration          : INVALID", file=sys.stderr)
+        print(exc, file=sys.stderr)
+        return 2
+
+    engine = create_engine_from_settings(settings)
+    with session_factory(engine)() as session:
+        result = scan_baskets(session, max_leg_age=dt.timedelta(seconds=max_age_seconds))
+
+    print(result.render(limit=limit))
+    return 0
+
+
 def _coverage() -> int:
     """Report continuous-collection coverage against the M1 exit gate."""
     from arbbot.collection.coverage import assess_coverage
@@ -204,6 +230,19 @@ def main(argv: list[str] | None = None) -> int:
         "coverage", help="report continuous-collection coverage against the M1 exit gate"
     )
 
+    baskets = subparsers.add_parser(
+        "baskets", help="scan the archive for baskets priced below their payout (research)"
+    )
+    baskets.add_argument(
+        "--max-leg-age",
+        type=float,
+        default=60.0,
+        metavar="SECONDS",
+        help="how far apart two legs' quotes may be and still count as one basket "
+        "(default: 60). Loosening this manufactures edges from quotes that never coexisted.",
+    )
+    baskets.add_argument("--limit", type=int, default=15, help="rows to show")
+
     serve = subparsers.add_parser("serve", help="serve the read-only operator API (/health)")
     serve.add_argument("--host", default="127.0.0.1", help="bind address (default: loopback)")
     serve.add_argument("--port", type=int, default=8000)
@@ -231,6 +270,8 @@ def main(argv: list[str] | None = None) -> int:
         return _doctor()
     if args.command == "serve":
         return _serve(args.host, args.port)
+    if args.command == "baskets":
+        return _baskets(args.max_leg_age, args.limit)
     if args.command == "coverage":
         return _coverage()
     if args.command == "collect":
