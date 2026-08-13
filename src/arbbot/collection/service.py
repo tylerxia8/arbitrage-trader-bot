@@ -34,7 +34,12 @@ from dataclasses import dataclass, field
 
 from sqlalchemy.orm import Session, sessionmaker
 
-from arbbot.collection.collector import MarketCollector, PollOutcome
+from arbbot.collection.collector import (
+    CHANNEL,
+    MIN_POLL_DEADLINE_SECONDS,
+    MarketCollector,
+    PollOutcome,
+)
 from arbbot.collection.health import utc_now
 from arbbot.venues.kalshi import KalshiAdapter
 from arbbot.venues.kalshi.rest import KalshiRestClient
@@ -116,6 +121,7 @@ class CollectionService:
         market_source: MarketSource | None = None,
         refresh_interval_seconds: float = 900.0,
         progress_interval_seconds: float = 600.0,
+        channel: str = CHANNEL,
     ) -> None:
         """
         :param market_source: called periodically to re-resolve the live
@@ -141,6 +147,7 @@ class CollectionService:
         self._last_refresh: dt.datetime | None = None
         adapter = adapter or KalshiAdapter()
         self._adapter = adapter
+        self._channel = channel
         # One poll may not outlast the cycle it belongs to. Otherwise a single
         # broken market holds the whole cycle open through the client's backoff
         # ladder, and every other market's sampling cadence slips with it.
@@ -155,7 +162,10 @@ class CollectionService:
             ticker=ticker,
             client=self._client,
             adapter=self._adapter,
-            poll_deadline_seconds=self._poll_interval,
+            channel=self._channel,
+            # Floored: a one-second probe with a one-second deadline would kill
+            # requests that were merely slow and record them as failures.
+            poll_deadline_seconds=max(self._poll_interval, MIN_POLL_DEADLINE_SECONDS),
         )
 
     async def refresh_markets(self, *, now: dt.datetime | None = None) -> RefreshReport:

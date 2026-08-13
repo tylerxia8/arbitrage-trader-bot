@@ -190,6 +190,53 @@ class TestHealthSampling:
         assert sample.parse_errors == 1
 
 
+class TestProbeIsolation:
+    async def test_a_probe_archives_under_its_own_channel(
+        self, factory: sessionmaker[Session]
+    ) -> None:
+        """Two pollers at different cadences must not share a subscription key.
+
+        They would collide on the archive's identity constraint and corrupt
+        each other's resumed sequence -- so a one-second probe and the
+        thirty-second collector are separate streams of the same market.
+        """
+        from arbbot.collection.collector import PROBE_CHANNEL
+
+        broad = service_over(factory, lambda r: httpx.Response(200, json=GOOD), ["AAA"])
+        probe = service_over(
+            factory, lambda r: httpx.Response(200, json=GOOD), ["AAA"], channel=PROBE_CHANNEL
+        )
+
+        assert broad.collectors[0].subscription_key != probe.collectors[0].subscription_key
+
+    async def test_both_streams_archive_independently(self, factory: sessionmaker[Session]) -> None:
+        from arbbot.collection.collector import PROBE_CHANNEL
+
+        broad = service_over(factory, lambda r: httpx.Response(200, json=GOOD), ["AAA"])
+        probe = service_over(
+            factory, lambda r: httpx.Response(200, json=GOOD), ["AAA"], channel=PROBE_CHANNEL
+        )
+        await broad.run_cycle(now=T0)
+        await probe.run_cycle(now=T0)
+
+        assert count(factory, RawMessage) == 2
+
+    async def test_a_short_interval_does_not_starve_the_deadline(
+        self, factory: sessionmaker[Session]
+    ) -> None:
+        """A one-second probe with a one-second deadline would kill requests
+        that were merely slow and record them as failures rather than data."""
+        service = service_over(
+            factory,
+            lambda r: httpx.Response(200, json=GOOD),
+            ["AAA"],
+            poll_interval_seconds=1.0,
+        )
+        deadline = service.collectors[0].poll_deadline_seconds
+        assert deadline is not None
+        assert deadline >= 3.0
+
+
 class TestMarketRefresh:
     async def test_rotates_to_the_new_days_markets(self, factory: sessionmaker[Session]) -> None:
         """The rotation problem: daily markets settle overnight, and a

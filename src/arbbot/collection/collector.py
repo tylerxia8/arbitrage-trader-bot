@@ -52,7 +52,20 @@ __all__ = ["CHANNEL", "MarketCollector", "PollOutcome", "PollResult"]
 #: Logical channel name for the polled orderbook. Part of the subscription key,
 #: so a future WebSocket stream of the same market archives separately rather
 #: than interleaving two different sampling regimes into one sequence space.
+#:
+#: The same reasoning applies to two *pollers* at different cadences: a probe
+#: sampling every second and the broad collector sampling every thirty would
+#: otherwise share a subscription key, collide on the archive's identity
+#: constraint, and corrupt each other's resumed sequence.
 CHANNEL = "orderbook_poll"
+
+#: Channel for a high-frequency probe of a single event.
+PROBE_CHANNEL = "orderbook_probe"
+
+#: A poll may not be given less than this to complete, however short the
+#: interval. A one-second probe with a one-second deadline would kill requests
+#: that were merely slow, and record them as failures rather than as data.
+MIN_POLL_DEADLINE_SECONDS = 3.0
 
 
 class PollOutcome(enum.StrEnum):
@@ -86,6 +99,7 @@ class MarketCollector:
     client: KalshiRestClient
     adapter: KalshiAdapter = field(default_factory=KalshiAdapter)
 
+    channel: str = CHANNEL
     poll_deadline_seconds: float | None = 30.0
     """Hard ceiling on one poll, retries included.
 
@@ -112,7 +126,7 @@ class MarketCollector:
 
     @property
     def subscription_key(self) -> str:
-        return self.adapter.subscription_key(CHANNEL, self.ticker)
+        return self.adapter.subscription_key(self.channel, self.ticker)
 
     def resume(self, session: Session) -> int:
         """Continue this stream's sequence from what is already archived.
@@ -165,7 +179,7 @@ class MarketCollector:
 
         archived = self.archive.record(
             session,
-            channel=CHANNEL,
+            channel=self.channel,
             payload=fetched.payload,
             subscription_key=self.subscription_key,
             sequence=sequence,

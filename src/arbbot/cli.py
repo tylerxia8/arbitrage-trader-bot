@@ -199,6 +199,82 @@ def _baskets(max_age_seconds: float, limit: int) -> int:
     return 0
 
 
+def _probe(interval: float, event_ticker: str | None) -> int:
+    """Poll one event's legs at high frequency to measure how long edges last.
+
+    Every profitable episode the archive has shown so far reports a duration of
+    zero seconds, which only means "shorter than one thirty-second poll". One
+    second and twenty-nine seconds imply opposite conclusions -- the first says
+    nothing at retail latency can capture it, the second says the edge is real
+    and the collector is too slow. This resolves which.
+    """
+    import asyncio
+    import logging
+
+    from arbbot.collection.collector import PROBE_CHANNEL
+    from arbbot.collection.service import CollectionService
+    from arbbot.db.session import session_factory
+    from arbbot.venues.kalshi.rest import KalshiRestClient
+    from arbbot.venues.kalshi.universe import UniverseResolver
+
+    try:
+        settings = load_settings()
+    except ValidationError as exc:
+        print("configuration          : INVALID", file=sys.stderr)
+        print(exc, file=sys.stderr)
+        return 2
+
+    logging.basicConfig(
+        level=settings.log_level,
+        format="%(asctime)s %(levelname)-7s %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+    for noisy in ("httpx", "httpcore"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
+
+    async def run() -> None:
+        engine = create_engine_from_settings(settings)
+        # A rate budget of its own, so the probe cannot throttle the broad
+        # collector: both draw on the venue's bucket, and 6 requests a second
+        # here leaves the collector's eight intact inside the ~20/s tier.
+        async with KalshiRestClient(
+            base_url=settings.venue_api_base, requests_per_second=6
+        ) as client:
+            resolver = UniverseResolver(client)
+            legs = await resolver.resolve()
+            if event_ticker:
+                legs = [t for t in legs if t.startswith(event_ticker)]
+            else:
+                # Whichever complete partition the resolver lists first, taken
+                # whole: a probe on part of a basket measures nothing.
+                first_event = legs[0].rsplit("-", 1)[0] if legs else ""
+                legs = [t for t in legs if t.rsplit("-", 1)[0] == first_event]
+
+            if not legs:
+                print("no live partition matched; nothing to probe", file=sys.stderr)
+                return
+
+            print(f"probing {len(legs)} legs of {legs[0].rsplit('-', 1)[0]} every {interval}s")
+            print("archived under a separate channel, so the broad collector is unaffected")
+
+            service = CollectionService(
+                session_factory=session_factory(engine),
+                client=client,
+                tickers=legs,
+                poll_interval_seconds=interval,
+                channel=PROBE_CHANNEL,
+                progress_interval_seconds=120.0,
+            )
+            service.resume_all()
+            await service.run_forever()
+
+    try:
+        asyncio.run(run())
+    except KeyboardInterrupt:
+        print("\nstopped")
+    return 0
+
+
 def _falsify(quantity: str, research: bool) -> int:
     """Replay the archive through the detector and report where candidates die."""
     from decimal import Decimal
@@ -265,6 +341,17 @@ def main(argv: list[str] | None = None) -> int:
     )
     baskets.add_argument("--limit", type=int, default=15, help="rows to show")
 
+    probe = subparsers.add_parser(
+        "probe",
+        help="poll one event's legs at high frequency to measure how long edges last",
+    )
+    probe.add_argument(
+        "--interval", type=float, default=1.0, help="seconds between polls (default: 1)"
+    )
+    probe.add_argument(
+        "--event", default=None, help="event ticker to probe (default: first live partition)"
+    )
+
     falsify = subparsers.add_parser(
         "falsify", help="replay the archive through the detector and report the funnel"
     )
@@ -307,6 +394,8 @@ def main(argv: list[str] | None = None) -> int:
         return _serve(args.host, args.port)
     if args.command == "baskets":
         return _baskets(args.max_leg_age, args.limit)
+    if args.command == "probe":
+        return _probe(args.interval, args.event)
     if args.command == "falsify":
         return _falsify(args.quantity, not args.strict)
     if args.command == "coverage":
