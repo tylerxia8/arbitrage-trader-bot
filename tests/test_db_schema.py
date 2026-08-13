@@ -23,6 +23,7 @@ EXPECTED_TABLES = {
     "audit_event",
     "book_snapshot",
     "feed_health",
+    "evaluation",
 }
 
 

@@ -33,12 +33,13 @@ from sqlalchemy import (
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
-from arbbot.db.base import Base, BigIntPk, Json, Sha256, Timestamp
+from arbbot.db.base import Base, BigIntPk, Json, Money, Sha256, Timestamp
 from arbbot.relationships import ApprovalDecision, RelationshipStatus, RelationshipType
 
 __all__ = [
     "Approval",
     "AuditEvent",
+    "Evaluation",
     "Market",
     "RawMessage",
     "RelationshipRecord",
@@ -322,6 +323,61 @@ class FeedHealth(Base):
 
     __table_args__ = (
         Index("ix_feed_health_stream_observed", "venue", "subscription_key", "observed_ts"),
+    )
+
+
+class Evaluation(Base):
+    """One pricing decision, accepted or rejected, with its inputs.
+
+    **Rejections are persisted too**, and that is the point. "Nothing
+    qualified today" is a useless sentence and a countable set of reason codes
+    is a finding, so the falsification report is built from this table rather
+    than from the acceptances alone -- which would be a table of successes
+    with no denominator.
+
+    Every row carries the versions it was decided under (FR-003, NFR-03). When
+    the fee model or the parser turns out to have been wrong, this is what
+    makes the past re-derivable instead of merely regrettable.
+    """
+
+    __tablename__ = "evaluation"
+
+    id: Mapped[BigIntPk]
+    evaluated_ts: Mapped[Timestamp] = mapped_column(server_default=func.now())
+
+    relationship_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("relationship.id", ondelete="RESTRICT")
+    )
+    """RESTRICT: a relationship with decisions behind it cannot be deleted out
+    from under them."""
+
+    relationship_slug: Mapped[str] = mapped_column(String(128))
+    relationship_version: Mapped[int] = mapped_column(Integer)
+
+    accepted: Mapped[bool] = mapped_column(Boolean, default=False)
+    reason: Mapped[str | None] = mapped_column(String(64))
+    """Rejection reason code, from the closed catalog. NULL when accepted."""
+
+    detail: Mapped[str | None] = mapped_column(Text)
+
+    quantity: Mapped[Money]
+    acquisition_cost: Mapped[Money]
+    fees: Mapped[Money]
+    reserves: Mapped[Money]
+    guaranteed_payout: Mapped[Money]
+    net_edge: Mapped[Money]
+
+    legs: Mapped[Json]
+    """Per-leg quotes and depth walks, so the decision reproduces exactly."""
+
+    fee_rule: Mapped[str] = mapped_column(String(64))
+    parser_version: Mapped[str] = mapped_column(String(32))
+    max_book_age_ms: Mapped[int] = mapped_column(Integer)
+
+    __table_args__ = (
+        Index("ix_evaluation_slug_ts", "relationship_slug", "evaluated_ts"),
+        Index("ix_evaluation_reason", "reason", "evaluated_ts"),
+        Index("ix_evaluation_accepted", "accepted", "evaluated_ts"),
     )
 
 
