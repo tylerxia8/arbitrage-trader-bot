@@ -56,6 +56,29 @@ venue's ~20/second read budget.
 restart outside active hours will stop everything until someone logs back in.
 Worth setting active hours wide, or pausing updates for the week.
 
+## Book age, and what this archive can and cannot support
+
+Measured on the live run: **worst observed book age 15.2 seconds**, against a
+30-second poll interval. That is arithmetic, not a fault — 120 markets at the
+client's 8 requests/second is a 15-second cycle, so the first market polled is
+15 seconds old by the time the cycle ends, and any book is 0–30 seconds old at
+an arbitrary moment.
+
+It has a consequence worth stating before anyone reads a result off this
+archive. The configured staleness threshold is `max_quote_age_ms = 2000`. A
+detector applying it to this data would reject **every** evaluation, correctly:
+a fifteen-second-old book is not evidence that a price was executable.
+
+So this archive can answer *"do priced inconsistencies appear, and how often"*.
+It cannot, on its own, answer *"could one have been executed"*. That second
+question needs either the WebSocket feed — which requires a credential, still
+an open owner decision — or an explicit acknowledgement that the M3 capture
+estimate is an upper bound built on stale quotes.
+
+Do not resolve this by raising the staleness threshold to fit the data. The
+threshold describes what execution requires; loosening it to make polled data
+qualify would produce candidates that look executable and are not.
+
 ## Reading the result
 
 The gate measures *collector* continuity — that something was always being
