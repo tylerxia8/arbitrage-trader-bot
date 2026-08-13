@@ -61,7 +61,7 @@ class TestGate:
         assessment = assess_coverage(session, now=T0 + dt.timedelta(days=7))
 
         assert assessment.meets_gate
-        assert assessment.streams[0].longest_continuous >= GATE_DURATION
+        assert assessment.longest_continuous >= GATE_DURATION
 
     def test_six_days_does_not(self, session: Session) -> None:
         add_samples(session, T0, dt.timedelta(days=6))
@@ -80,8 +80,8 @@ class TestGaps:
         stream = assessment.streams[0]
 
         assert stream.span > GATE_DURATION
-        assert not stream.meets_gate
-        assert stream.longest_continuous < dt.timedelta(days=5)
+        assert not assessment.meets_gate
+        assert assessment.longest_continuous < dt.timedelta(days=5)
 
     def test_the_largest_gap_is_reported(self, session: Session) -> None:
         add_samples(session, T0, dt.timedelta(hours=1))
@@ -97,11 +97,11 @@ class TestGaps:
         assert assess_coverage(session, now=T0 + dt.timedelta(days=1)).streams[0].gaps == []
 
     def test_current_silence_is_recorded_as_an_outage(self, session: Session) -> None:
-        """Ongoing silence is a gap, so the report is honest that nothing is
-        collecting right now."""
+        """Ongoing silence is a collector-level outage, so the report is
+        honest that nothing is collecting right now."""
         add_samples(session, T0, dt.timedelta(days=2))
         assessment = assess_coverage(session, now=T0 + dt.timedelta(days=2, hours=3))
-        assert assessment.streams[0].gaps
+        assert assessment.collector_gaps
 
     def test_a_completed_week_survives_the_collector_stopping(self, session: Session) -> None:
         """Coverage measures the archive; /health measures now. A finished
@@ -110,7 +110,7 @@ class TestGaps:
         add_samples(session, T0, dt.timedelta(days=7))
         assessment = assess_coverage(session, now=T0 + dt.timedelta(days=7, hours=3))
 
-        assert assessment.streams[0].gaps, "the outage should still be visible"
+        assert assessment.collector_gaps, "the outage should still be visible"
         assert assessment.meets_gate, "seven continuous days were collected"
 
     def test_an_unfinished_run_is_not_rescued_by_stopping(self, session: Session) -> None:
@@ -120,28 +120,66 @@ class TestGaps:
         assert not assessment.meets_gate
 
 
-class TestMultipleStreams:
-    def test_every_stream_must_clear_the_gate(self, session: Session) -> None:
-        """A basket needs all its legs. Seven days on five markets and four on
-        the sixth does not evidence a basket."""
-        add_samples(session, T0, dt.timedelta(days=7), key="orderbook_poll:AAA")
-        add_samples(session, T0, dt.timedelta(days=4), key="orderbook_poll:BBB")
+class TestRotatingMarkets:
+    def test_daily_markets_can_still_meet_the_gate(self, session: Session) -> None:
+        """The case that forced the gate to be rewritten.
+
+        The recommended universe is daily temperature partitions: they exist
+        for about a day and then settle. Requiring seven unbroken days *per
+        stream* is unsatisfiable by construction, and a gate no correct run
+        can pass is a bug, not a standard. Seven consecutive one-day markets,
+        handed over cleanly, is exactly what seven days of continuous
+        collection looks like here.
+        """
+        for day in range(7):
+            add_samples(
+                session,
+                T0 + dt.timedelta(days=day),
+                dt.timedelta(days=1),
+                key=f"orderbook_poll:KXHIGHTATL-DAY{day}",
+            )
 
         assessment = assess_coverage(session, now=T0 + dt.timedelta(days=7))
-        assert len(assessment.streams) == 2
+        assert len(assessment.streams) == 7
+        assert assessment.meets_gate
+        assert not assessment.interrupted_streams
+
+    def test_a_market_ending_is_not_an_interruption(self, session: Session) -> None:
+        """A stream stopping because its market settled is the market ending,
+        not a hole in collection."""
+        add_samples(session, T0, dt.timedelta(hours=20), key="orderbook_poll:DAY0")
+        add_samples(session, T0 + dt.timedelta(hours=20), dt.timedelta(hours=20), key="op:DAY1")
+
+        assessment = assess_coverage(session, now=T0 + dt.timedelta(hours=40))
+        assert assessment.collector_gaps == []
+
+    def test_a_handover_hole_is_an_outage(self, session: Session) -> None:
+        """If nothing was being collected between one day's markets and the
+        next, that window is genuinely unobserved."""
+        add_samples(session, T0, dt.timedelta(hours=10), key="orderbook_poll:DAY0")
+        add_samples(session, T0 + dt.timedelta(hours=16), dt.timedelta(hours=10), key="op:DAY1")
+
+        assessment = assess_coverage(session, now=T0 + dt.timedelta(hours=26))
+        assert assessment.collector_gaps
         assert not assessment.meets_gate
 
-    def test_the_weakest_stream_sets_the_headline(self, session: Session) -> None:
-        add_samples(session, T0, dt.timedelta(days=7), key="orderbook_poll:AAA")
-        add_samples(session, T0, dt.timedelta(days=2), key="orderbook_poll:BBB")
+    def test_a_stream_interrupted_while_listed_is_flagged(self, session: Session) -> None:
+        """Separate from the gate: a market that went quiet while still live
+        costs a basket a leg, even on an otherwise continuous run."""
+        # Same key either side of the hole: one market that went quiet and
+        # came back while still listed.
+        add_samples(session, T0, dt.timedelta(hours=2), key="orderbook_poll:AAA")
+        add_samples(
+            session, T0 + dt.timedelta(hours=8), dt.timedelta(hours=2), key="orderbook_poll:AAA"
+        )
+        add_samples(session, T0, dt.timedelta(hours=10), key="orderbook_poll:STEADY")
 
-        assessment = assess_coverage(session, now=T0 + dt.timedelta(days=7))
-        assert assessment.shortest_continuous < dt.timedelta(days=3)
-
-    def test_all_streams_passing_meets_the_gate(self, session: Session) -> None:
-        add_samples(session, T0, dt.timedelta(days=7), key="orderbook_poll:AAA")
-        add_samples(session, T0, dt.timedelta(days=7), key="orderbook_poll:BBB")
-        assert assess_coverage(session, now=T0 + dt.timedelta(days=7)).meets_gate
+        assessment = assess_coverage(session, now=T0 + dt.timedelta(hours=10))
+        interrupted = {s.subscription_key for s in assessment.interrupted_streams}
+        assert "orderbook_poll:AAA" in interrupted
+        assert "orderbook_poll:STEADY" not in interrupted
+        # The collector never stopped, because STEADY covered the window.
+        assert assessment.collector_gaps == []
 
 
 class TestRendering:
@@ -157,5 +195,5 @@ class TestRendering:
         add_samples(session, T0 + dt.timedelta(hours=13), dt.timedelta(hours=1))
 
         rendered = assess_coverage(session, now=T0 + dt.timedelta(hours=14)).render()
-        assert "largest outage" in rendered
+        assert "largest collection outage" in rendered
         assert "NOT MET" in rendered

@@ -16,6 +16,11 @@ than minutes:
 *   **Health is sampled on a timer, not per message.** A collector that has
     stopped writes nothing at all, which is indistinguishable from a quiet
     market unless something independent is recording the silence.
+*   **The market set is refreshed, not fixed.** The recommended universe is
+    daily temperature partitions, and they rotate: yesterday's Atlanta event
+    already has zero active markets. A collector started on Monday with a
+    literal ticker list spends Tuesday through Sunday polling settled
+    contracts and archiving nothing, while reporting itself perfectly healthy.
 """
 
 from __future__ import annotations
@@ -23,7 +28,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import datetime as dt
-from collections.abc import Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
 
 from sqlalchemy.orm import Session, sessionmaker
@@ -33,7 +38,24 @@ from arbbot.collection.health import utc_now
 from arbbot.venues.kalshi import KalshiAdapter
 from arbbot.venues.kalshi.rest import KalshiRestClient
 
-__all__ = ["CollectionService", "CycleReport"]
+__all__ = ["CollectionService", "CycleReport", "MarketSource", "RefreshReport"]
+
+#: Resolves the currently-live market tickers. Async because it hits the venue.
+MarketSource = Callable[[], Awaitable[Sequence[str]]]
+
+
+@dataclass(frozen=True, slots=True)
+class RefreshReport:
+    """Outcome of re-resolving the live market set."""
+
+    at: dt.datetime
+    added: tuple[str, ...]
+    removed: tuple[str, ...]
+    failed: str | None = None
+
+    @property
+    def changed(self) -> bool:
+        return bool(self.added or self.removed)
 
 
 @dataclass(slots=True)
@@ -45,6 +67,7 @@ class CycleReport:
     unchanged: int = 0
     failed: int = 0
     errors: list[str] = field(default_factory=list)
+    refresh: RefreshReport | None = None
 
     @property
     def polled(self) -> int:
@@ -69,8 +92,20 @@ class CollectionService:
         poll_interval_seconds: float = 5.0,
         health_interval_seconds: float = 30.0,
         adapter: KalshiAdapter | None = None,
+        market_source: MarketSource | None = None,
+        refresh_interval_seconds: float = 900.0,
     ) -> None:
-        if not tickers:
+        """
+        :param market_source: called periodically to re-resolve the live
+            market set. Without one the ticker list is fixed, which is correct
+            for a short run and wrong for a seven-day one against daily
+            markets -- they settle overnight and the collector keeps polling
+            contracts that no longer trade.
+        """
+        if not tickers and market_source is None:
+            # An empty list is only acceptable when something will fill it. A
+            # collector with nothing to poll and no way to find anything would
+            # report itself healthy forever while producing no evidence.
             raise ValueError("a collector with no markets would report itself healthy forever")
         if poll_interval_seconds <= 0:
             raise ValueError("poll_interval_seconds must be positive")
@@ -79,25 +114,73 @@ class CollectionService:
         self._client = client
         self._poll_interval = poll_interval_seconds
         self._health_interval = health_interval_seconds
+        self._market_source = market_source
+        self._refresh_interval = refresh_interval_seconds
+        self._last_refresh: dt.datetime | None = None
         adapter = adapter or KalshiAdapter()
+        self._adapter = adapter
         # One poll may not outlast the cycle it belongs to. Otherwise a single
         # broken market holds the whole cycle open through the client's backoff
         # ladder, and every other market's sampling cadence slips with it.
-        self.collectors = [
-            MarketCollector(
-                ticker=ticker,
-                client=client,
-                adapter=adapter,
-                poll_deadline_seconds=poll_interval_seconds,
-            )
-            for ticker in tickers
-        ]
+        self.collectors = [self._make_collector(ticker) for ticker in tickers]
         self._last_health_sample: dt.datetime | None = None
+
+    def _make_collector(self, ticker: str) -> MarketCollector:
+        return MarketCollector(
+            ticker=ticker,
+            client=self._client,
+            adapter=self._adapter,
+            poll_deadline_seconds=self._poll_interval,
+        )
+
+    async def refresh_markets(self, *, now: dt.datetime | None = None) -> RefreshReport:
+        """Re-resolve the live market set and reconcile the collector list.
+
+        Collectors for markets that survive the refresh are **kept**, not
+        rebuilt. Their sequence counter, last-payload hash, and health history
+        live in the object; discarding it would restart sequences mid-run and
+        re-archive an unchanged book as though it were new.
+        """
+        at = now or utc_now()
+        if self._market_source is None:
+            return RefreshReport(at, added=(), removed=(), failed="no market source configured")
+
+        try:
+            live = list(await self._market_source())
+        except Exception as exc:
+            # Keep collecting the markets we already have. A venue hiccup
+            # during a refresh should cost freshness, never continuity.
+            return RefreshReport(at, added=(), removed=(), failed=f"{type(exc).__name__}: {exc}")
+
+        if not live:
+            return RefreshReport(at, added=(), removed=(), failed="venue returned no live markets")
+
+        current = {c.ticker: c for c in self.collectors}
+        wanted = set(live)
+
+        added = tuple(sorted(wanted - current.keys()))
+        removed = tuple(sorted(current.keys() - wanted))
+
+        self.collectors = [current[t] for t in sorted(wanted & current.keys())] + [
+            self._make_collector(t) for t in added
+        ]
+        self._last_refresh = at
+        return RefreshReport(at, added=added, removed=removed)
+
+    def _should_refresh(self, at: dt.datetime) -> bool:
+        if self._market_source is None:
+            return False
+        if self._last_refresh is None:
+            return True
+        return (at - self._last_refresh).total_seconds() >= self._refresh_interval
 
     async def run_cycle(self, *, now: dt.datetime | None = None) -> CycleReport:
         """Poll every market once and persist the results."""
         at = now or utc_now()
         report = CycleReport(started_ts=at)
+
+        if self._should_refresh(at):
+            report.refresh = await self.refresh_markets(now=at)
 
         with self._session_factory() as session:
             for collector in self.collectors:

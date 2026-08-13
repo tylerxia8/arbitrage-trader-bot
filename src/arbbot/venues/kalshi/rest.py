@@ -182,6 +182,17 @@ class KalshiRestClient:
                 return collected
             seen_cursors.add(cursor)
 
+    async def fetch(self, path: str, params: dict[str, Any] | None = None) -> FetchedPayload:
+        """Any public GET, rate-limited and retried like the rest.
+
+        Exists so that callers such as the universe resolver cannot quietly
+        open their own unlimited connection to the venue. One resolver pass
+        touches every temperature series; done outside the limiter it earns a
+        429 immediately, and a refresh mid-run would then throttle the
+        collector that depends on the same bucket.
+        """
+        return await self._get(path, params or {})
+
     async def fetch_orderbook(self, ticker: str, *, depth: int = 0) -> FetchedPayload:
         """``GET /markets/{ticker}/orderbook``. Public; no credential required.
 

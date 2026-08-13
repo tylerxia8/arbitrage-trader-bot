@@ -114,51 +114,81 @@ class CoverageAssessment:
 
     streams: list[StreamCoverage]
     assessed_ts: dt.datetime
+    collector_gaps: list[CoverageGap] = field(default_factory=list)
+    first_sample: dt.datetime | None = None
+    last_sample: dt.datetime | None = None
+
+    @property
+    def longest_continuous(self) -> dt.timedelta:
+        """Longest stretch during which *something* was being collected.
+
+        This, not per-stream continuity, is what the gate measures -- and the
+        distinction is forced by the markets themselves. The recommended
+        universe is daily temperature partitions, which exist for about a day
+        and then settle: yesterday's Atlanta event already has zero active
+        markets. Requiring seven unbroken days per stream would be
+        unsatisfiable by construction, and a gate no correct run can pass is
+        not a gate, it is a bug.
+
+        What seven days of continuous collection means for rotating markets is
+        that the collector was alive and gathering whatever was live, without
+        a hole where nobody was watching.
+        """
+        if self.first_sample is None or self.last_sample is None:
+            return dt.timedelta(0)
+
+        boundaries = [self.first_sample]
+        for gap in sorted(self.collector_gaps, key=lambda g: g.started_ts):
+            boundaries.extend([gap.started_ts, gap.ended_ts])
+        boundaries.append(self.last_sample)
+
+        return max(
+            (boundaries[i + 1] - boundaries[i] for i in range(0, len(boundaries) - 1, 2)),
+            default=dt.timedelta(0),
+        )
 
     @property
     def meets_gate(self) -> bool:
-        """Every stream must clear the gate, not the best one.
-
-        A basket needs all its legs. Seven unbroken days on five markets and
-        four days on the sixth does not evidence a basket -- it evidences five
-        legs of one.
-        """
-        return bool(self.streams) and all(s.meets_gate for s in self.streams)
+        return bool(self.streams) and self.longest_continuous >= GATE_DURATION
 
     @property
-    def shortest_continuous(self) -> dt.timedelta:
-        return min((s.longest_continuous for s in self.streams), default=dt.timedelta(0))
+    def interrupted_streams(self) -> list[StreamCoverage]:
+        """Streams that went quiet *during their own lifetime*.
+
+        A market ending is not an interruption; it is the market ending. A
+        market that stopped reporting while still listed is a real hole, and
+        this is where a basket loses a leg.
+        """
+        return [s for s in self.streams if s.gaps]
 
     def render(self) -> str:
         if not self.streams:
             return "no collection recorded: the gate cannot be met by an empty archive"
 
+        days = self.longest_continuous.total_seconds() / 86400
         lines = [
-            f"{'stream':<44} {'span':>8} {'unbroken':>9} {'gaps':>5}  gate",
-            "-" * 80,
+            f"streams observed:          {len(self.streams)}",
+            f"continuous collection:     {days:.2f} days of the {GATE_DURATION.days} required",
         ]
-        for stream in sorted(self.streams, key=lambda s: s.longest_continuous):
-            lines.append(
-                f"{stream.subscription_key:<44} "
-                f"{stream.span.days:>6}d "
-                f"{stream.longest_continuous.total_seconds() / 86400:>8.2f}d "
-                f"{len(stream.gaps):>5}  "
-                f"{'PASS' if stream.meets_gate else 'no'}"
-            )
 
-        worst = max(
-            (g for s in self.streams for g in s.gaps),
-            key=lambda g: g.duration,
-            default=None,
-        )
-        lines.append("")
-        lines.append(
-            f"shortest unbroken stretch: "
-            f"{self.shortest_continuous.total_seconds() / 86400:.2f} days "
-            f"of the {GATE_DURATION.days} required"
-        )
+        worst = max(self.collector_gaps, key=lambda g: g.duration, default=None)
         if worst is not None:
-            lines.append(f"largest outage:            {worst}")
+            lines.append(f"largest collection outage: {worst}")
+            lines.append(f"outages:                   {len(self.collector_gaps)}")
+        else:
+            lines.append("largest collection outage: none")
+
+        interrupted = self.interrupted_streams
+        if interrupted:
+            # Reported separately from the gate: a hole in one market's stream
+            # while it was still listed costs a basket a leg, even on a run
+            # that was otherwise continuous.
+            lines.append("")
+            lines.append(f"streams interrupted while listed: {len(interrupted)}")
+            for stream in sorted(interrupted, key=lambda s: -s.longest_gap)[:5]:
+                lines.append(f"  {stream.subscription_key:<44} worst {stream.gaps[0]}")
+
+        lines.append("")
         lines.append(f"exit gate:                 {'MET' if self.meets_gate else 'NOT MET'}")
         return "\n".join(lines)
 
@@ -182,27 +212,47 @@ def assess_coverage(
         stamped = observed if observed.tzinfo else observed.replace(tzinfo=dt.UTC)
         by_stream.setdefault(key, []).append(stamped)
 
+    # Collector liveness is the union across streams: while any stream was
+    # sampling, collection was happening. Individual markets rotate daily, so
+    # only the union can be continuous across a week.
+    all_stamps = sorted({stamp for stamps in by_stream.values() for stamp in stamps})
+    collector_gaps = [
+        CoverageGap(previous, following)
+        for previous, following in pairwise(all_stamps)
+        if following - previous > gap_threshold
+    ]
+    if all_stamps and at - all_stamps[-1] > gap_threshold:
+        collector_gaps.append(CoverageGap(all_stamps[-1], at))
+
     streams: list[StreamCoverage] = []
     for key, stamps in by_stream.items():
-        gaps = [
-            CoverageGap(previous, following)
-            for previous, following in pairwise(stamps)
-            if following - previous > gap_threshold
-        ]
-        # Silence since the last sample is an ongoing outage, not a tidy end,
-        # so it is recorded. It does not retract the stretch before it: a
-        # completed week stays completed once the collector is stopped.
-        if stamps and at - stamps[-1] > gap_threshold:
-            gaps.append(CoverageGap(stamps[-1], at))
-
+        # Internal gaps only. Silence *after* a stream's last sample is not an
+        # interruption -- for a daily market it is simply the market settling,
+        # and counting it would flag every expired contract as a hole. Whether
+        # anything is collecting *now* is a property of the collector, not of
+        # one market, and is measured on the union above.
         streams.append(
             StreamCoverage(
                 subscription_key=key,
                 first_sample=stamps[0] if stamps else None,
-                last_sample=at if stamps and at - stamps[-1] > gap_threshold else stamps[-1],
+                last_sample=stamps[-1] if stamps else None,
                 samples=len(stamps),
-                gaps=gaps,
+                gaps=[
+                    CoverageGap(previous, following)
+                    for previous, following in pairwise(stamps)
+                    if following - previous > gap_threshold
+                ],
             )
         )
 
-    return CoverageAssessment(streams=streams, assessed_ts=at)
+    return CoverageAssessment(
+        streams=streams,
+        assessed_ts=at,
+        collector_gaps=collector_gaps,
+        first_sample=all_stamps[0] if all_stamps else None,
+        last_sample=(
+            at
+            if all_stamps and at - all_stamps[-1] > gap_threshold
+            else (all_stamps[-1] if all_stamps else None)
+        ),
+    )

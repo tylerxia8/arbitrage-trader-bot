@@ -74,13 +74,14 @@ def _doctor() -> int:
     return 0 if ok else 1
 
 
-def _collect(tickers: list[str], poll_interval: float) -> int:
+def _collect(tickers: list[str], poll_interval: float, use_universe: bool) -> int:
     """Run the polling collector until interrupted."""
     import asyncio
 
     from arbbot.collection.service import CollectionService
     from arbbot.db.session import session_factory
     from arbbot.venues.kalshi.rest import KalshiRestClient
+    from arbbot.venues.kalshi.universe import UniverseResolver
 
     try:
         settings = load_settings()
@@ -92,12 +93,23 @@ def _collect(tickers: list[str], poll_interval: float) -> int:
     async def run() -> None:
         engine = create_engine_from_settings(settings)
         async with KalshiRestClient(base_url=settings.venue_api_base) as client:
+            resolver = UniverseResolver(client)
+            if use_universe:
+                # Left empty deliberately: the service resolves on its first
+                # cycle. Pre-resolving here would run a full pass over every
+                # temperature series twice at startup.
+                print("resolving live temperature partitions from the venue...")
+
             service = CollectionService(
                 session_factory=session_factory(engine),
                 client=client,
-                tickers=tickers,
+                tickers=[] if use_universe else tickers,
                 poll_interval_seconds=poll_interval,
+                market_source=resolver.resolve if use_universe else None,
             )
+            if use_universe:
+                await service.refresh_markets()
+                print(f"collecting {len(service.collectors)} markets")
             resumed = service.resume_all()
             for ticker, sequence in resumed.items():
                 print(f"  {ticker}: resuming from sequence {sequence}")
@@ -143,7 +155,15 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     collect = subparsers.add_parser("collect", help="poll public order books and archive them")
-    collect.add_argument("tickers", nargs="+", help="market tickers to collect")
+    collect.add_argument(
+        "tickers", nargs="*", help="market tickers to collect (omit with --universe)"
+    )
+    collect.add_argument(
+        "--universe",
+        action="store_true",
+        help="resolve live temperature partitions from the venue and refresh them "
+        "as markets rotate, instead of using a fixed ticker list",
+    )
     collect.add_argument(
         "--interval",
         type=float,
@@ -158,7 +178,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "coverage":
         return _coverage()
     if args.command == "collect":
-        return _collect(args.tickers, args.interval)
+        if not args.tickers and not args.universe:
+            parser.error("give tickers or --universe")
+        return _collect(args.tickers, args.interval, args.universe)
     parser.error(f"unknown command {args.command!r}")  # pragma: no cover -- NoReturn
 
 

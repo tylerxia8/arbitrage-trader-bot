@@ -190,6 +190,121 @@ class TestHealthSampling:
         assert sample.parse_errors == 1
 
 
+class TestMarketRefresh:
+    async def test_rotates_to_the_new_days_markets(self, factory: sessionmaker[Session]) -> None:
+        """The rotation problem: daily markets settle overnight, and a
+        collector on a literal ticker list spends the rest of the week polling
+        dead contracts while reporting itself healthy."""
+        live = ["DAY1-A", "DAY1-B"]
+
+        async def source() -> list[str]:
+            return live
+
+        service = service_over(
+            factory,
+            lambda r: httpx.Response(200, json=GOOD),
+            ["DAY0-A", "DAY0-B"],
+            market_source=source,
+            refresh_interval_seconds=0,
+        )
+        report = await service.run_cycle(now=T0)
+
+        assert report.refresh is not None
+        assert report.refresh.added == ("DAY1-A", "DAY1-B")
+        assert report.refresh.removed == ("DAY0-A", "DAY0-B")
+        assert {c.ticker for c in service.collectors} == {"DAY1-A", "DAY1-B"}
+
+    async def test_surviving_markets_keep_their_state(self, factory: sessionmaker[Session]) -> None:
+        """Rebuilding a surviving collector would restart its sequence
+        mid-run and re-archive an unchanged book as though it were new."""
+
+        async def source() -> list[str]:
+            return ["AAA", "BBB"]
+
+        service = service_over(
+            factory,
+            lambda r: httpx.Response(200, json=GOOD),
+            ["AAA"],
+            market_source=source,
+            refresh_interval_seconds=0,
+        )
+        await service.run_cycle(now=T0)
+        original = next(c for c in service.collectors if c.ticker == "AAA")
+        await service.run_cycle(now=T0 + dt.timedelta(seconds=5))
+
+        assert next(c for c in service.collectors if c.ticker == "AAA") is original
+
+    async def test_a_failed_refresh_keeps_the_current_markets(
+        self, factory: sessionmaker[Session]
+    ) -> None:
+        """A venue hiccup during a refresh should cost freshness, never
+        continuity -- losing the run because /events blipped would be absurd."""
+
+        async def source() -> list[str]:
+            raise httpx.ConnectError("venue unreachable")
+
+        service = service_over(
+            factory,
+            lambda r: httpx.Response(200, json=GOOD),
+            ["AAA"],
+            market_source=source,
+            refresh_interval_seconds=0,
+        )
+        report = await service.run_cycle(now=T0)
+
+        assert report.refresh is not None
+        assert report.refresh.failed is not None
+        assert [c.ticker for c in service.collectors] == ["AAA"]
+        assert report.stored == 1
+
+    async def test_an_empty_universe_is_refused(self, factory: sessionmaker[Session]) -> None:
+        """Accepting it would leave the collector with nothing to poll while
+        still reporting itself alive."""
+
+        async def source() -> list[str]:
+            return []
+
+        service = service_over(
+            factory,
+            lambda r: httpx.Response(200, json=GOOD),
+            ["AAA"],
+            market_source=source,
+            refresh_interval_seconds=0,
+        )
+        report = await service.run_cycle(now=T0)
+
+        assert report.refresh is not None
+        assert "no live markets" in (report.refresh.failed or "")
+        assert [c.ticker for c in service.collectors] == ["AAA"]
+
+    async def test_refresh_respects_its_interval(self, factory: sessionmaker[Session]) -> None:
+        calls = 0
+
+        async def source() -> list[str]:
+            nonlocal calls
+            calls += 1
+            return ["AAA"]
+
+        service = service_over(
+            factory,
+            lambda r: httpx.Response(200, json=GOOD),
+            ["AAA"],
+            market_source=source,
+            refresh_interval_seconds=900,
+        )
+        await service.run_cycle(now=T0)
+        await service.run_cycle(now=T0 + dt.timedelta(minutes=5))
+        assert calls == 1
+
+        await service.run_cycle(now=T0 + dt.timedelta(minutes=20))
+        assert calls == 2
+
+    async def test_no_source_means_no_refresh(self, factory: sessionmaker[Session]) -> None:
+        service = service_over(factory, lambda r: httpx.Response(200, json=GOOD), ["AAA"])
+        report = await service.run_cycle(now=T0)
+        assert report.refresh is None
+
+
 class TestRunForever:
     async def test_stops_when_asked(self, factory: sessionmaker[Session]) -> None:
         service = service_over(
