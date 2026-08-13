@@ -43,5 +43,35 @@ services:
       - ./src:/app/src:ro
       - ./alembic:/app/alembic:ro
 
+  # The seven-day collection run. Started explicitly:
+  #     docker compose --profile collect up -d
+  # It is behind a profile so that an ordinary `docker compose up` for
+  # development does not quietly start collecting against the live venue.
+  collector:
+    build:
+      context: .
+    profiles: ["collect"]
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      ARBBOT_ENVIRONMENT: research
+      ARBBOT_DATABASE_URL: postgresql+psycopg://arbbot:arbbot@db:5432/arbbot
+      ARBBOT_LOG_LEVEL: INFO
+    # No credentials, by design and by enforcement: the config layer rejects
+    # one in the research environment (threat T1).
+    command: ["collect", "--universe", "--interval", "30"]
+    # The exit gate is seven days of *continuous* collection, and a bare
+    # process that dies at 3am leaves a hole that cannot be backfilled -- the
+    # venue does not re-send what nobody asked for. Restarting is safe because
+    # the collector resumes each stream's sequence from the archive.
+    restart: unless-stopped
+    stop_grace_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
+
 volumes:
   pgdata:

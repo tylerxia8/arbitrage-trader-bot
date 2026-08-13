@@ -108,12 +108,23 @@ def _collect(tickers: list[str], poll_interval: float, use_universe: bool) -> in
                 market_source=resolver.resolve if use_universe else None,
             )
             if use_universe:
-                await service.refresh_markets()
-                print(f"collecting {len(service.collectors)} markets")
+                refresh = await service.refresh_markets()
+                if refresh.failed:
+                    print(f"could not resolve the universe: {refresh.failed}", file=sys.stderr)
+                    return
+
             resumed = service.resume_all()
-            for ticker, sequence in resumed.items():
-                print(f"  {ticker}: resuming from sequence {sequence}")
-            print(f"collecting {len(tickers)} market(s) every {poll_interval}s; Ctrl-C to stop")
+            carried = {t: s for t, s in resumed.items() if s > 0}
+            if carried:
+                print(f"resuming {len(carried)} stream(s) from the existing archive")
+
+            # Count the collectors, not the argument list: with --universe the
+            # tickers come from the venue, and reporting the empty input list
+            # made a healthy collector announce "collecting 0 market(s)".
+            print(
+                f"collecting {len(service.collectors)} market(s) "
+                f"every {poll_interval}s; Ctrl-C to stop"
+            )
             await service.run_forever()
 
     try:
