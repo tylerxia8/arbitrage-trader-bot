@@ -56,6 +56,7 @@ money_path_roots = [
     "src/arbbot/fees",        # M2
     "src/arbbot/economics",   # M2
     "src/arbbot/detector",    # M2
+    "src/arbbot/registry",    # M2
     "src/arbbot/ledger",      # M3
     "src/arbbot/execution",   # M4
 ]
