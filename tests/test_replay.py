@@ -9,6 +9,7 @@ which is the whole reason the archive exists.
 
 from __future__ import annotations
 
+from decimal import Decimal
 from typing import Any
 
 from sqlalchemy.orm import Session
@@ -44,7 +45,7 @@ def decode(payload: dict[str, Any]) -> BookEvent | None:
             ticker=payload["ticker"],
             sequence=payload["seq"],
             levels=tuple(
-                (BookSide(side), PriceLevel(int(price), int(qty)))
+                (BookSide(side), PriceLevel(Decimal(price).scaleb(-2), Decimal(qty)))
                 for side, levels in payload["levels"].items()
                 for price, qty in levels.items()
             ),
@@ -54,7 +55,9 @@ def decode(payload: dict[str, Any]) -> BookEvent | None:
             ticker=payload["ticker"],
             sequence=payload["seq"],
             delta=BookDelta(
-                BookSide(payload["side"]), int(payload["price"]), int(payload["delta"])
+                BookSide(payload["side"]),
+                Decimal(payload["price"]).scaleb(-2),
+                Decimal(payload["delta"]),
             ),
         )
     return None  # heartbeats and status messages are not book events

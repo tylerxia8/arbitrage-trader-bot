@@ -3,6 +3,10 @@
 The rounding-direction tests are the important ones. Everything downstream --
 fee deduction, depth-weighted cost, net edge -- inherits its safety from the
 guarantee that a cost is never understated and a payout never overstated.
+
+The venue-parsing tests encode what the live API actually sends: prices as
+dollar strings with up to four decimals, contract counts as fractional
+strings. Both were verified against production on 2026-08-12.
 """
 
 from __future__ import annotations
@@ -17,11 +21,13 @@ from arbbot.money import (
     CENT,
     MoneyError,
     from_cents,
+    parse_quantity,
+    parse_venue_dollars,
     quantize_cost,
     quantize_proceeds,
     to_cents_exact,
     to_usd,
-    validate_price_cents,
+    validate_price_dollars,
 )
 
 
@@ -52,7 +58,7 @@ class TestToUsd:
             to_usd("thirty-five cents")
 
 
-class TestVenueConversion:
+class TestCentConversion:
     def test_from_cents(self) -> None:
         assert from_cents(35) == Decimal("0.35")
         assert from_cents(1) == Decimal("0.01")
@@ -73,24 +79,14 @@ class TestVenueConversion:
 class TestConservativeRounding:
     @pytest.mark.parametrize(
         ("amount", "expected"),
-        [
-            ("0.3501", "0.36"),
-            ("0.3500", "0.35"),
-            ("0.3599", "0.36"),
-            ("1.000001", "1.01"),
-        ],
+        [("0.3501", "0.36"), ("0.3500", "0.35"), ("0.3599", "0.36"), ("1.000001", "1.01")],
     )
     def test_cost_rounds_up(self, amount: str, expected: str) -> None:
         assert quantize_cost(Decimal(amount)) == Decimal(expected)
 
     @pytest.mark.parametrize(
         ("amount", "expected"),
-        [
-            ("0.3599", "0.35"),
-            ("0.3500", "0.35"),
-            ("0.3501", "0.35"),
-            ("0.999999", "0.99"),
-        ],
+        [("0.3599", "0.35"), ("0.3500", "0.35"), ("0.3501", "0.35"), ("0.999999", "0.99")],
     )
     def test_proceeds_round_down(self, amount: str, expected: str) -> None:
         assert quantize_proceeds(Decimal(amount)) == Decimal(expected)
@@ -127,17 +123,48 @@ def test_rounding_brackets_the_true_value(amount: Decimal) -> None:
 
 
 class TestPriceValidation:
-    @pytest.mark.parametrize("price", [1, 50, 99])
-    def test_accepts_tradeable_prices(self, price: int) -> None:
-        assert validate_price_cents(price) == price
+    @pytest.mark.parametrize("price", ["0.0001", "0.50", "0.9999"])
+    def test_accepts_tradeable_prices(self, price: str) -> None:
+        assert validate_price_dollars(Decimal(price)) == Decimal(price)
 
-    @pytest.mark.parametrize("price", [0, 100, -1, 101])
-    def test_rejects_untradeable_prices(self, price: int) -> None:
-        """A leg at 0c or 100c has effectively resolved; pricing a basket
+    @pytest.mark.parametrize("price", ["0", "1.00", "-0.01", "1.01"])
+    def test_rejects_untradeable_prices(self, price: str) -> None:
+        """A leg at $0 or $1 has effectively resolved; pricing a basket
         against it would fabricate an arbitrage out of a settled market."""
         with pytest.raises(MoneyError, match="outside the tradeable range"):
-            validate_price_cents(price)
+            validate_price_dollars(Decimal(price))
 
-    def test_rejects_bool(self) -> None:
-        with pytest.raises(MoneyError, match="plain integers"):
-            validate_price_cents(True)
+
+class TestVenueParsing:
+    def test_parses_a_dollar_price_string(self) -> None:
+        assert parse_venue_dollars("0.5900") == Decimal("0.5900")
+
+    def test_parses_a_sub_cent_price(self) -> None:
+        """deci_cent markets quote $0.001 steps; truncating to whole cents
+        would move the price by a full tick."""
+        assert parse_venue_dollars("0.0125") == Decimal("0.0125")
+
+    def test_parses_a_fractional_contract_count(self) -> None:
+        """A live book shows sizes like 809.25."""
+        assert parse_quantity("809.25") == Decimal("809.25")
+
+    def test_rejects_a_numeric_price(self) -> None:
+        """The venue sends strings so precision survives transport; a JSON
+        number has already been through a float by the time it reaches us."""
+        with pytest.raises(MoneyError, match="strings"):
+            parse_venue_dollars(0.59)  # type: ignore[arg-type]
+
+    def test_rejects_precision_beyond_the_venue_granularity(self) -> None:
+        """More precision than the venue documents means the wire format
+        changed and this parser no longer understands it."""
+        with pytest.raises(MoneyError, match="granularity"):
+            parse_venue_dollars("0.123456")
+
+    def test_rejects_a_quantity_finer_than_a_hundredth(self) -> None:
+        with pytest.raises(MoneyError, match="granularity"):
+            parse_quantity("1.001")
+
+    def test_rejects_a_negative_contract_count(self) -> None:
+        """Sizes are unsigned; a signed delta strips its sign before parsing."""
+        with pytest.raises(MoneyError, match="negative"):
+            parse_quantity("-5.00")

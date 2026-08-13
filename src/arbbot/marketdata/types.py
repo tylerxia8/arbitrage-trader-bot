@@ -11,10 +11,12 @@ from __future__ import annotations
 import datetime as dt
 import enum
 from dataclasses import dataclass
-from typing import Final
+from decimal import Decimal
+
+from arbbot.money import PAYOUT_DOLLARS, ZERO
 
 __all__ = [
-    "BINARY_PAYOUT_CENTS",
+    "PAYOUT_DOLLARS",
     "BookDelta",
     "BookEvent",
     "BookSide",
@@ -25,10 +27,10 @@ __all__ = [
     "SnapshotEvent",
 ]
 
-#: A binary event contract settles at 100 cents or 0. The complement of a YES
-#: bid at price p is a NO ask at (100 - p), which is the identity the whole
-#: order-book model rests on.
-BINARY_PAYOUT_CENTS: Final = 100
+# The complement of a YES bid at price p is a NO ask at ($1.00 - p), which is
+# the identity the whole order-book model rests on. PAYOUT_DOLLARS is
+# re-exported from arbbot.money so there is exactly one definition of what a
+# contract pays.
 
 
 class BookSide(enum.StrEnum):
@@ -68,30 +70,37 @@ class MarketStatus(enum.StrEnum):
 
 @dataclass(frozen=True, slots=True)
 class PriceLevel:
-    """A resting quantity at a price. Prices are integer cents; sizes are
-    whole contracts. Neither is ever a float."""
+    """A resting quantity at a price.
 
-    price_cents: int
-    quantity: int
+    Both fields are exact decimals -- never floats, and never integers. Prices
+    carry up to four decimal places because tick size varies per market: a
+    ``deci_cent`` market quotes in $0.001 steps. Contract counts carry two,
+    because fractional positions are real; a live book shows sizes like
+    ``809.25``. Truncating either to whole units misstates the cost or the
+    depth of every level it touches.
+    """
+
+    price_dollars: Decimal
+    quantity: Decimal
 
     def __post_init__(self) -> None:
-        if self.quantity < 0:
-            raise ValueError(f"negative quantity at {self.price_cents}c: {self.quantity}")
+        if self.quantity < ZERO:
+            raise ValueError(f"negative quantity at ${self.price_dollars}: {self.quantity}")
 
 
 @dataclass(frozen=True, slots=True)
 class BookDelta:
     """An incremental change to one price level.
 
-    ``delta`` is signed: positive adds resting size, negative removes it. The
-    venue sends changes rather than absolute levels, so a dropped message
-    corrupts every subsequent level — which is why sequence gaps invalidate
-    the book rather than merely warning.
+    ``delta`` is a signed contract count: positive adds resting size, negative
+    removes it. The venue sends changes rather than absolute levels, so a
+    dropped message corrupts every subsequent level — which is why sequence
+    gaps invalidate the book rather than merely warning.
     """
 
     side: BookSide
-    price_cents: int
-    delta: int
+    price_dollars: Decimal
+    delta: Decimal
 
 
 @dataclass(frozen=True, slots=True)

@@ -10,6 +10,7 @@ held a credential.
 
 from __future__ import annotations
 
+from decimal import Decimal
 from typing import Any
 
 from arbbot.marketdata.types import (
@@ -44,13 +45,13 @@ class FakeAdapter:
             return SnapshotEvent(
                 ticker=payload["ticker"],
                 sequence=payload["seq"],
-                levels=((BookSide.YES, PriceLevel(40, 10)),),
+                levels=((BookSide.YES, PriceLevel(Decimal("0.40"), Decimal("10"))),),
             )
         if payload.get("kind") == "delta":
             return DeltaEvent(
                 ticker=payload["ticker"],
                 sequence=payload["seq"],
-                delta=BookDelta(BookSide.YES, 40, 1),
+                delta=BookDelta(BookSide.YES, Decimal("0.40"), Decimal("1")),
             )
         return None
 

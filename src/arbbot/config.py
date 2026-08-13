@@ -136,8 +136,9 @@ class Settings(BaseSettings):
     database_url: str = "postgresql+psycopg://arbbot:arbbot@localhost:5432/arbbot"
     log_level: str = "INFO"
 
-    venue_api_base: str = "https://api.elections.kalshi.com/trade-api/v2"
-    venue_ws_url: str = "wss://api.elections.kalshi.com/trade-api/ws/v2"
+    # Verified against the live API on 2026-08-12. See docs/venue-findings.md.
+    venue_api_base: str = "https://external-api.kalshi.com/trade-api/v2"
+    venue_ws_url: str = "wss://external-api-ws.kalshi.com/"
     venue_api_key_id: SecretStr | None = None
     venue_private_key_pem: SecretStr | None = None
 

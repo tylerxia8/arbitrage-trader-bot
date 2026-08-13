@@ -6,7 +6,7 @@ from arbbot.marketdata.book import BookIntegrityError, OrderBook
 from arbbot.marketdata.reconstruct import ApplyOutcome, BookReconstructor, ReconstructionStats
 from arbbot.marketdata.sequence import SequenceTracker, SequenceVerdict
 from arbbot.marketdata.types import (
-    BINARY_PAYOUT_CENTS,
+    PAYOUT_DOLLARS,
     BookDelta,
     BookEvent,
     BookSide,
@@ -17,7 +17,7 @@ from arbbot.marketdata.types import (
 )
 
 __all__ = [
-    "BINARY_PAYOUT_CENTS",
+    "PAYOUT_DOLLARS",
     "ApplyOutcome",
     "BookDelta",
     "BookEvent",

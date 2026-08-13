@@ -2,7 +2,7 @@
 
 Every scenario here is something a real WebSocket does on a bad day:
 re-delivers messages after a reconnect, drops one, restarts its numbering.
-The requirement is not that reconstruction survives these gracefully — it is
+The requirement is not that reconstruction survives these gracefully â€” it is
 that it never produces a *plausible but wrong* book, because a book that is
 three contracts too deep at one level looks exactly like a book that is
 genuinely that deep, and the error surfaces as an arbitrage that does not fill.
@@ -11,6 +11,7 @@ genuinely that deep, and the error surfaces as an arbitrage that does not fill.
 from __future__ import annotations
 
 from collections.abc import Iterable
+from decimal import Decimal
 
 import pytest
 from hypothesis import given
@@ -29,11 +30,16 @@ from arbbot.marketdata.types import (
 TICKER = "TEST-MARKET"
 
 
+def cents(value: int) -> Decimal:
+    """Cent integers keep these fixtures readable; the model is Decimal dollars."""
+    return Decimal(value).scaleb(-2)
+
+
 def snapshot(
     sequence: int, yes: dict[int, int] | None = None, no: dict[int, int] | None = None
 ) -> SnapshotEvent:
     levels = tuple(
-        (side, PriceLevel(price, qty))
+        (side, PriceLevel(cents(price), Decimal(qty)))
         for side, prices in ((BookSide.YES, yes or {}), (BookSide.NO, no or {}))
         for price, qty in prices.items()
     )
@@ -41,7 +47,11 @@ def snapshot(
 
 
 def delta(sequence: int, side: BookSide, price: int, change: int) -> DeltaEvent:
-    return DeltaEvent(ticker=TICKER, sequence=sequence, delta=BookDelta(side, price, change))
+    return DeltaEvent(
+        ticker=TICKER,
+        sequence=sequence,
+        delta=BookDelta(side, cents(price), Decimal(change)),
+    )
 
 
 def drive(events: Iterable[BookEvent]) -> BookReconstructor:
@@ -68,8 +78,11 @@ class TestCleanStream:
 
     def test_produces_the_expected_book(self) -> None:
         r = drive(CLEAN_STREAM)
-        assert r.book.bids(BookSide.YES) == [PriceLevel(41, 3), PriceLevel(40, 15)]
-        assert r.book.bids(BookSide.NO) == [PriceLevel(55, 5)]
+        assert r.book.bids(BookSide.YES) == [
+            PriceLevel(cents(41), Decimal(3)),
+            PriceLevel(cents(40), Decimal(15)),
+        ]
+        assert r.book.bids(BookSide.NO) == [PriceLevel(cents(55), Decimal(5))]
 
 
 class TestDuplicates:
@@ -141,7 +154,7 @@ class TestRepair:
         )
         assert r.is_usable
         assert r.stats.repaired == 1
-        assert r.book.bids(BookSide.YES) == [PriceLevel(42, 4)]
+        assert r.book.bids(BookSide.YES) == [PriceLevel(cents(42), Decimal(4))]
 
     def test_repaired_book_accepts_deltas_again(self) -> None:
         r = drive(
@@ -153,7 +166,7 @@ class TestRepair:
             ]
         )
         assert r.is_usable
-        assert r.book.bids(BookSide.YES) == [PriceLevel(42, 10)]
+        assert r.book.bids(BookSide.YES) == [PriceLevel(cents(42), Decimal(10))]
 
     def test_repair_discards_the_stale_levels(self) -> None:
         """Whatever the corrupted book held is exactly what must not survive."""
@@ -189,13 +202,16 @@ class TestRewind:
             ]
         )
         assert r.is_usable
-        assert r.book.bids(BookSide.YES) == [PriceLevel(7, 2)]
+        assert r.book.bids(BookSide.YES) == [PriceLevel(cents(7), Decimal(2))]
 
 
 class TestMalformedEvents:
     def test_impossible_price_is_rejected_without_killing_the_stream(self) -> None:
         r = drive(
-            [snapshot(1, yes={40: 10}), DeltaEvent(TICKER, 2, BookDelta(BookSide.YES, 100, +1))]
+            [
+                snapshot(1, yes={40: 10}),
+                DeltaEvent(TICKER, 2, BookDelta(BookSide.YES, Decimal("1.00"), Decimal(1))),
+            ]
         )
         assert r.stats.rejected == 1
 

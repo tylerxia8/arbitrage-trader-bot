@@ -19,9 +19,13 @@ convention:
     down. A candidate must never look profitable because of a rounding
     direction. See :func:`quantize_cost` and :func:`quantize_proceeds`.
 
-Venue prices arrive as integer cents (1..99 for a binary contract). Adapters
-convert at the boundary with :func:`from_cents`; nothing downstream should
-handle a raw venue integer as if it were dollars.
+Venue prices arrive as *decimal dollar strings* with up to four decimal
+places, and contract counts as fixed-point strings with up to two. Both are
+parsed at the adapter boundary by :func:`parse_venue_dollars` and
+:func:`parse_quantity`. The string encoding exists so the values survive
+transport exactly; letting a JSON library turn them into floats -- which is
+what it does unless told otherwise -- throws away the precision the venue went
+to the trouble of preserving.
 """
 
 from __future__ import annotations
@@ -32,18 +36,23 @@ from typing import Final
 
 __all__ = [
     "CENT",
-    "MAX_PRICE_CENTS",
-    "MIN_PRICE_CENTS",
+    "MAX_PRICE_DOLLARS",
+    "MIN_PRICE_DOLLARS",
+    "PAYOUT_DOLLARS",
+    "PRICE_QUANTUM",
+    "QUANTITY_QUANTUM",
     "USD_QUANTUM",
     "ZERO",
     "MoneyError",
     "from_cents",
     "money_context",
+    "parse_quantity",
+    "parse_venue_dollars",
     "quantize_cost",
     "quantize_proceeds",
     "to_cents_exact",
     "to_usd",
-    "validate_price_cents",
+    "validate_price_dollars",
 ]
 
 
@@ -62,11 +71,26 @@ USD_QUANTUM: Final = Decimal("0.00000001")
 
 ZERO: Final = Decimal("0")
 
-#: A binary contract that has not settled trades strictly inside 0 and 100
-#: cents. A quote at 0 or 100 is a settled or degenerate market, not a
-#: tradeable price, and must be rejected rather than treated as free money.
-MIN_PRICE_CENTS: Final = 1
-MAX_PRICE_CENTS: Final = 99
+#: What one binary contract pays if it settles YES.
+PAYOUT_DOLLARS: Final = Decimal("1.00")
+
+#: Finest price granularity the venue quotes. Kalshi expresses prices as dollar
+#: strings with up to four decimal places, and tick size varies *per market*:
+#: ``linear_cent`` markets step by $0.01, ``deci_cent`` markets by $0.001.
+#: Assuming whole cents would silently truncate a real deci-cent quote, which
+#: on a basket of several legs is more than enough to invent or destroy an edge.
+PRICE_QUANTUM: Final = Decimal("0.0001")
+
+#: Finest size granularity. Contract counts are fixed-point strings with up to
+#: two decimals -- fractional positions are real, and a live book routinely
+#: shows sizes like ``809.25``. Integer quantities would round every level.
+QUANTITY_QUANTUM: Final = Decimal("0.01")
+
+#: An unsettled binary contract trades strictly inside $0 and $1. A quote at
+#: either bound is a settled or degenerate market, not a tradeable price, and
+#: must be rejected rather than treated as free money.
+MIN_PRICE_DOLLARS: Final = PRICE_QUANTUM
+MAX_PRICE_DOLLARS: Final = PAYOUT_DOLLARS - PRICE_QUANTUM
 
 
 def money_context() -> decimal.Context:
@@ -159,18 +183,77 @@ def quantize_proceeds(amount: Decimal) -> Decimal:
         return to_usd(amount).quantize(CENT, rounding=decimal.ROUND_FLOOR)
 
 
-def validate_price_cents(price_cents: int) -> int:
-    """Return ``price_cents`` if it is a tradeable binary-contract price.
+def _decimal_places(value: Decimal) -> int:
+    """Number of digits after the point.
 
-    :raises MoneyError: if the price is outside 1..99. A leg quoted at 0 or
-        100 is not a bargain; it is a market that has effectively resolved,
-        and pricing a basket against it would fabricate an arbitrage.
+    ``as_tuple().exponent`` is a string sentinel for NaN and infinity, which
+    the callers here have already excluded via :func:`to_usd` -- but the type
+    checker cannot see that, and a silent ``TypeError`` deep in a parser is a
+    worse outcome than an explicit check.
     """
-    if not isinstance(price_cents, int) or isinstance(price_cents, bool):
-        raise MoneyError(f"venue prices must be plain integers (got {price_cents!r})")
-    if not MIN_PRICE_CENTS <= price_cents <= MAX_PRICE_CENTS:
+    exponent = value.as_tuple().exponent
+    if not isinstance(exponent, int):
+        raise MoneyError(f"{value} has no finite exponent")
+    return max(0, -exponent)
+
+
+def parse_venue_dollars(value: str) -> Decimal:
+    """Parse a venue ``*_dollars`` price string, e.g. ``"0.5900"``.
+
+    The venue sends prices as decimal strings precisely so they survive
+    transport exactly. Parsing them through :class:`float` -- the obvious
+    thing a JSON library does by default -- reintroduces the representation
+    error the string encoding exists to avoid, which is why this goes via
+    :func:`to_usd` and why ``float`` is banned from this module entirely.
+
+    :raises MoneyError: if the value is not an exact decimal, or carries more
+        precision than the venue's quoted granularity (which would mean the
+        wire format changed and this parser no longer understands it).
+    """
+    if not isinstance(value, str):
+        raise MoneyError(f"venue prices arrive as strings (got {type(value).__name__})")
+    amount = to_usd(value)
+    if _decimal_places(amount) > _decimal_places(PRICE_QUANTUM):
         raise MoneyError(
-            f"price {price_cents}c is outside the tradeable range "
-            f"{MIN_PRICE_CENTS}..{MAX_PRICE_CENTS}"
+            f"price {value!r} is finer than the venue's {PRICE_QUANTUM} granularity; "
+            "the wire format may have changed"
         )
-    return price_cents
+    return amount
+
+
+def parse_quantity(value: str) -> Decimal:
+    """Parse a venue ``*_fp`` contract-count string, e.g. ``"809.25"``.
+
+    Counts are fractional. Rounding them to whole contracts would misstate
+    available depth at every level, and depth is what decides whether an
+    apparent edge is executable at size or is a single contract's worth of
+    nothing.
+    """
+    if not isinstance(value, str):
+        raise MoneyError(f"venue quantities arrive as strings (got {type(value).__name__})")
+    quantity = to_usd(value)
+    if quantity < ZERO:
+        raise MoneyError(f"contract count cannot be negative (got {value!r})")
+    if _decimal_places(quantity) > _decimal_places(QUANTITY_QUANTUM):
+        raise MoneyError(
+            f"quantity {value!r} is finer than the venue's {QUANTITY_QUANTUM} granularity; "
+            "the wire format may have changed"
+        )
+    return quantity
+
+
+def validate_price_dollars(price: Decimal) -> Decimal:
+    """Return ``price`` if it is a tradeable binary-contract price.
+
+    :raises MoneyError: if the price is not strictly inside $0 and $1. A leg
+        quoted at either bound is not a bargain; it is a market that has
+        effectively resolved, and pricing a basket against it would fabricate
+        an arbitrage out of a settled contract.
+    """
+    amount = to_usd(price)
+    if not MIN_PRICE_DOLLARS <= amount <= MAX_PRICE_DOLLARS:
+        raise MoneyError(
+            f"price ${amount} is outside the tradeable range "
+            f"${MIN_PRICE_DOLLARS}..${MAX_PRICE_DOLLARS}"
+        )
+    return amount
