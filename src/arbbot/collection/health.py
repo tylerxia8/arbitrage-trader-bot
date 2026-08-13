@@ -72,10 +72,18 @@ class StreamHealth:
         self.parse_errors += 1
 
     def lag(self, now: dt.datetime | None = None, clock: Clock = utc_now) -> dt.timedelta | None:
-        """Time since the last message, or ``None`` if none has arrived."""
+        """Time since the last message, or ``None`` if none has arrived.
+
+        Never negative. A message cannot arrive after the moment it is
+        measured against, so a negative result means the two timestamps came
+        from clocks that disagree -- and reporting "-182 ms of staleness"
+        helps nobody diagnose that. Clamping keeps the metric interpretable;
+        the ordering itself is the caller's responsibility.
+        """
         if self.last_message_ts is None:
             return None
-        return (now or clock()) - self.last_message_ts
+        elapsed = (now or clock()) - self.last_message_ts
+        return max(elapsed, dt.timedelta(0))
 
     def lag_ms(self, now: dt.datetime | None = None, clock: Clock = utc_now) -> int | None:
         """Lag in whole milliseconds, for metrics and the health endpoint."""

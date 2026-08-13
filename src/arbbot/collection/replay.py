@@ -32,7 +32,12 @@ __all__ = ["BookEventDecoder", "ReplayResult", "replay_archive", "replay_events"
 #: not a book message (a heartbeat, a status update, an unrelated channel).
 #: Raising instead of returning ``None`` signals a payload that *should* have
 #: decoded and did not, which is counted as a decode failure.
-BookEventDecoder = Callable[[dict[str, Any]], BookEvent | None]
+#: Receives the archived sequence number alongside the payload. Wire formats
+#: that carry their own sequence ignore it; polled REST snapshots depend on it,
+#: because that sequence is assigned by the collector and stored in the archive
+#: row rather than inside the venue payload -- which must stay exactly as the
+#: venue sent it.
+BookEventDecoder = Callable[[dict[str, Any], int | None], BookEvent | None]
 
 
 @dataclass(slots=True)
@@ -105,10 +110,10 @@ def replay_archive(
     reconstructor = BookReconstructor(ticker)
     read = decoded = failures = 0
 
-    for payload in _archived_payloads(session, venue, subscription_key, schema_version):
+    for payload, sequence in _archived_payloads(session, venue, subscription_key, schema_version):
         read += 1
         try:
-            event = decoder(payload)
+            event = decoder(payload, sequence)
         except Exception:
             failures += 1
             continue
@@ -134,8 +139,8 @@ def _archived_payloads(
     venue: str,
     subscription_key: str,
     schema_version: str | None,
-) -> Iterator[dict[str, Any]]:
-    """Stream archived payloads in wire order.
+) -> Iterator[tuple[dict[str, Any], int | None]]:
+    """Stream archived payloads, with their sequence numbers, in wire order.
 
     Ordered by primary key, which is insertion order, which is the order the
     messages arrived. Ordering by ``received_ts`` would be wrong: the column
@@ -147,7 +152,7 @@ def _archived_payloads(
     holding months of archive in memory.
     """
     stmt = (
-        select(RawMessage.payload)
+        select(RawMessage.payload, RawMessage.sequence)
         .where(
             RawMessage.venue == venue,
             RawMessage.subscription_key == subscription_key,
@@ -157,5 +162,5 @@ def _archived_payloads(
     if schema_version is not None:
         stmt = stmt.where(RawMessage.schema_version == schema_version)
 
-    for (payload,) in session.execute(stmt).yield_per(1000):
-        yield payload
+    for row in session.execute(stmt).yield_per(1000):
+        yield row.payload, row.sequence

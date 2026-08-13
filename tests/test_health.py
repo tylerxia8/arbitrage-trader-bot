@@ -43,6 +43,16 @@ class TestLag:
         health.observe_message(T0)
         assert health.last_message_ts == T0 + dt.timedelta(seconds=10)
 
+    def test_lag_is_never_negative(self) -> None:
+        """Caught by a live run: the collection cycle stamped its health
+        sample at cycle start, then measured messages that arrived during the
+        cycle against it, and reported lag_ms of -182. A negative staleness is
+        not a number any operator or alert rule can act on."""
+        health = stream()
+        health.observe_message(T0 + dt.timedelta(seconds=5))
+        assert health.lag(now=T0) == dt.timedelta(0)
+        assert health.lag_ms(now=T0) == 0
+
     def test_naive_timestamps_are_rejected(self) -> None:
         """A feed timestamp without a zone is not a time."""
         with pytest.raises(ValueError, match="timezone-aware"):

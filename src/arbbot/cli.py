@@ -74,15 +74,64 @@ def _doctor() -> int:
     return 0 if ok else 1
 
 
+def _collect(tickers: list[str], poll_interval: float) -> int:
+    """Run the polling collector until interrupted."""
+    import asyncio
+
+    from arbbot.collection.service import CollectionService
+    from arbbot.db.session import session_factory
+    from arbbot.venues.kalshi.rest import KalshiRestClient
+
+    try:
+        settings = load_settings()
+    except ValidationError as exc:
+        print("configuration          : INVALID", file=sys.stderr)
+        print(exc, file=sys.stderr)
+        return 2
+
+    async def run() -> None:
+        engine = create_engine_from_settings(settings)
+        async with KalshiRestClient(base_url=settings.venue_api_base) as client:
+            service = CollectionService(
+                session_factory=session_factory(engine),
+                client=client,
+                tickers=tickers,
+                poll_interval_seconds=poll_interval,
+            )
+            resumed = service.resume_all()
+            for ticker, sequence in resumed.items():
+                print(f"  {ticker}: resuming from sequence {sequence}")
+            print(f"collecting {len(tickers)} market(s) every {poll_interval}s; Ctrl-C to stop")
+            await service.run_forever()
+
+    try:
+        asyncio.run(run())
+    except KeyboardInterrupt:
+        print("\nstopped")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="arbbot", description=__doc__)
     parser.add_argument("--version", action="version", version=f"arbbot {__version__}")
     subparsers = parser.add_subparsers(dest="command", required=True)
     subparsers.add_parser("doctor", help="validate configuration and report execution gates")
 
+    collect = subparsers.add_parser("collect", help="poll public order books and archive them")
+    collect.add_argument("tickers", nargs="+", help="market tickers to collect")
+    collect.add_argument(
+        "--interval",
+        type=float,
+        default=5.0,
+        help="seconds between polls (default: 5). Opportunities shorter than "
+        "this are invisible to the collector.",
+    )
+
     args = parser.parse_args(argv)
     if args.command == "doctor":
         return _doctor()
+    if args.command == "collect":
+        return _collect(args.tickers, args.interval)
     parser.error(f"unknown command {args.command!r}")  # pragma: no cover -- NoReturn
 
 

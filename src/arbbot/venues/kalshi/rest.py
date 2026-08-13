@@ -97,11 +97,23 @@ class KalshiRestClient:
         *,
         requests_per_second: int = DEFAULT_RATE_LIMIT,
         timeout_seconds: float = 15.0,
+        max_attempts: int = _MAX_ATTEMPTS,
         client: httpx.AsyncClient | None = None,
     ) -> None:
+        """
+        :param max_attempts: how many times to try a request before giving up.
+            The default suits a one-off fetch. A caller on a short polling
+            cadence should lower it: the full backoff ladder spends about
+            thirty seconds before surrendering, which is far longer than a
+            five-second poll interval and would stall every other market in
+            the cycle behind one broken one.
+        """
+        if max_attempts < 1:
+            raise ValueError("max_attempts must be at least 1")
         self.base_url = base_url.rstrip("/")
         self.venue = VENUE
         self.schema_version = SCHEMA_VERSION
+        self.max_attempts = max_attempts
         self._limiter = RateLimiter(requests_per_second)
         self._owns_client = client is None
         self._client = client or httpx.AsyncClient(
@@ -184,12 +196,12 @@ class KalshiRestClient:
         url = f"{self.base_url}{path}"
         delay = _BACKOFF_BASE_SECONDS
 
-        for attempt in range(1, _MAX_ATTEMPTS + 1):
+        for attempt in range(1, self.max_attempts + 1):
             await self._limiter.acquire()
             try:
                 response = await self._client.get(url, params=params)
             except httpx.TransportError:
-                if attempt == _MAX_ATTEMPTS:
+                if attempt == self.max_attempts:
                     raise
                 await asyncio.sleep(delay)
                 delay = min(delay * 2, _BACKOFF_MAX_SECONDS)
@@ -200,7 +212,7 @@ class KalshiRestClient:
             if response.status_code == httpx.codes.TOO_MANY_REQUESTS or (
                 response.status_code >= httpx.codes.INTERNAL_SERVER_ERROR
             ):
-                if attempt == _MAX_ATTEMPTS:
+                if attempt == self.max_attempts:
                     response.raise_for_status()
                 await asyncio.sleep(delay)
                 delay = min(delay * 2, _BACKOFF_MAX_SECONDS)

@@ -32,7 +32,7 @@ STREAM = f"orderbook:{TICKER}"
 SCHEMA = "v1"
 
 
-def decode(payload: dict[str, Any]) -> BookEvent | None:
+def decode(payload: dict[str, Any], _sequence: int | None = None) -> BookEvent | None:
     """Minimal decoder standing in for a venue adapter.
 
     Deliberately pure: no clock, no network, no state. That is what allows the
@@ -225,7 +225,7 @@ class TestDecodeFailures:
     def test_a_bad_payload_does_not_end_the_replay(self, session: Session) -> None:
         """One unparseable message must not cost the whole history."""
 
-        def brittle(payload: dict[str, Any]) -> BookEvent | None:
+        def brittle(payload: dict[str, Any], _sequence: int | None = None) -> BookEvent | None:
             if payload.get("seq") == 4:
                 raise ValueError("cannot parse")
             return decode(payload)
@@ -242,7 +242,7 @@ class TestDecodeFailures:
         """It completed, but it did not reproduce the archive -- and saying so
         is the difference between a replay and a guess."""
 
-        def brittle(payload: dict[str, Any]) -> BookEvent | None:
+        def brittle(payload: dict[str, Any], _sequence: int | None = None) -> BookEvent | None:
             if payload.get("seq") == 4:
                 raise ValueError("cannot parse")
             return decode(payload)

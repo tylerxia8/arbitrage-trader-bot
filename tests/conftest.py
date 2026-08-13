@@ -14,6 +14,7 @@ from collections.abc import Iterator
 import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
+from sqlalchemy.pool import StaticPool
 
 from arbbot.db import models  # noqa: F401  -- registers tables on Base.metadata
 from arbbot.db.base import Base
@@ -29,7 +30,15 @@ def session() -> Iterator[Session]:
     the append-only triggers, migration reversibility -- are verified against
     a real server in CI instead.
     """
-    engine = create_engine("sqlite://")
+    # StaticPool keeps a single connection, which an in-memory database needs
+    # anyway -- a fresh connection would get a fresh, empty database.
+    # check_same_thread is off because FastAPI runs sync endpoints in a worker
+    # thread, and SQLite otherwise refuses the connection it was handed.
+    engine = create_engine(
+        "sqlite://",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
     Base.metadata.create_all(engine)
     with Session(engine) as db_session:
         yield db_session
