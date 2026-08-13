@@ -39,7 +39,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from arbbot.db.models import BookSnapshot
-from arbbot.fees import KALSHI_2022_SCHEDULE, FeeSchedule
+from arbbot.fees import KALSHI_SCHEDULE, FeeSchedule
 from arbbot.money import PAYOUT_DOLLARS, ZERO
 
 __all__ = [
@@ -99,11 +99,12 @@ class BasketObservation:
     """Smallest depth across the legs -- the basket cannot exceed it."""
 
     fee: Decimal = ZERO
-    """Estimated venue fee at ``max_contracts``, summed per leg.
+    """Venue taker fee at ``max_contracts``, summed per leg.
 
-    Estimated, not authoritative: the rule is transcribed from a 2022
-    regulatory filing and nobody has confirmed it is still in force, so
-    :mod:`arbbot.fees` refuses to qualify anything on it.
+    Taker, because assembling a basket means crossing the spread on every leg.
+    The rule is confirmed against the venue's published schedule, so this
+    figure is the real cost -- what remains unproven about the rows below is
+    the relationship, not the fee.
     """
 
     @property
@@ -275,10 +276,10 @@ class ScanResult:
         lines.append(f"                          net    : ${net_total:>8.2f}")
         lines.append(f"only the ones still positive     : ${positive:>8.2f}")
         lines.append("")
-        lines.append("Fees are ESTIMATED from a 2022 regulatory filing that nobody has")
-        lines.append("confirmed is still in force; arbbot.fees refuses to qualify on it.")
-        lines.append("Slippage, latency and capital cost are not modelled. Only the best")
-        lines.append("price level is used, and no relationship here has been approved.")
+        lines.append("Fees are TAKER fees on the confirmed general rule -- assembling a")
+        lines.append("basket crosses the spread on every leg. Slippage, latency and capital")
+        lines.append("cost are not modelled. Only the best price level is used, and no")
+        lines.append("relationship here has been approved.")
         return "\n".join(lines)
 
 
@@ -295,7 +296,7 @@ def scan_baskets(
     max_leg_age: dt.timedelta = DEFAULT_MAX_LEG_AGE,
     since: dt.datetime | None = None,
     event: str | None = None,
-    fees: FeeSchedule = KALSHI_2022_SCHEDULE,
+    fees: FeeSchedule = KALSHI_SCHEDULE,
 ) -> ScanResult:
     """Walk the archive and record every full, fresh set priced below payout.
 

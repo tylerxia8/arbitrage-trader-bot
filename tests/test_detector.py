@@ -28,7 +28,8 @@ VERIFIED_FEES = FeeSchedule(
     (
         FeeRule(
             name="test-verified",
-            rate=D("0.07"),
+            multiplier=D("1"),
+            maker_multiplier=D("0"),
             source="test",
             effective_from=dt.date(2020, 1, 1),
             verified=True,
@@ -40,7 +41,8 @@ FREE = FeeSchedule(
     (
         FeeRule(
             name="test-free",
-            rate=D("0"),
+            multiplier=D("0"),
+            maker_multiplier=D("0"),
             source="test",
             effective_from=dt.date(2020, 1, 1),
             verified=True,
@@ -184,10 +186,26 @@ class TestRejections:
 class TestFees:
     def test_an_unverified_fee_rule_refuses_the_candidate(self) -> None:
         """FR-010. A fee nobody has confirmed is an unknown fee, and an
-        unknown fee cannot produce an accepted candidate."""
-        from arbbot.fees import KALSHI_2022_SCHEDULE
+        unknown fee cannot produce an accepted candidate.
 
-        evaluation = evaluate_basket(request(["0.30", "0.30"], fees=KALSHI_2022_SCHEDULE))
+        Built here rather than taken from the shipped schedule, whose general
+        rule is now confirmed against the venue's published fee table. The
+        refusal is a property of the mechanism, not of whichever rules happen
+        to be unconfirmed this week.
+        """
+        unconfirmed = FeeSchedule(
+            (
+                FeeRule(
+                    name="test-unverified",
+                    multiplier=D("1"),
+                    maker_multiplier=D("0"),
+                    source="test",
+                    effective_from=dt.date(2020, 1, 1),
+                    verified=False,
+                ),
+            )
+        )
+        evaluation = evaluate_basket(request(["0.30", "0.30"], fees=unconfirmed))
         assert not evaluation.accepted
         assert evaluation.reason is RejectionReason.UNKNOWN_FEE
 

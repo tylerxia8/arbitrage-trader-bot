@@ -32,7 +32,8 @@ FREE = FeeSchedule(
     (
         FeeRule(
             name="free",
-            rate=D("0"),
+            multiplier=D("0"),
+            maker_multiplier=D("0"),
             source="test",
             effective_from=dt.date(2020, 1, 1),
             verified=True,
@@ -163,10 +164,21 @@ class TestRejections:
         assert evaluate_implication(req).reason is RejectionReason.STALE_QUOTE
 
     def test_an_unverified_fee_rule_is_refused(self) -> None:
-        from arbbot.fees import KALSHI_2022_SCHEDULE
-
+        """Built here rather than taken from the shipped schedule, whose
+        general rule is now confirmed against the venue's published table."""
         req = request(no_a="0.40", yes_b="0.40")
-        req.fees = KALSHI_2022_SCHEDULE
+        req.fees = FeeSchedule(
+            (
+                FeeRule(
+                    name="test-unverified",
+                    multiplier=D("1"),
+                    maker_multiplier=D("0"),
+                    source="test",
+                    effective_from=dt.date(2020, 1, 1),
+                    verified=False,
+                ),
+            )
+        )
         assert evaluate_implication(req).reason is RejectionReason.UNKNOWN_FEE
 
     def test_an_incomplete_book_is_refused(self) -> None:

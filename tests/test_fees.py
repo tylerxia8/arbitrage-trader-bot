@@ -4,6 +4,12 @@ The golden cases are the venue's own published fee table, transcribed from the
 CFTC filing. Reproducing a table someone else computed is the only way to know
 the formula was read correctly, and the go-live checklist requires exactly
 this: "exact fee model verified against venue examples".
+
+:class:`TestPublishedRanges` is the confirmation itself. The venue's current
+schedule quotes a fee *range* per series rather than a coefficient, and all
+four endpoints -- taker and maker, at a penny and at fifty cents -- fall out of
+this formula to the cent. That triangulates the rate, the shape and the
+rounding at once, which a single quoted number could not.
 """
 
 from __future__ import annotations
@@ -14,13 +20,18 @@ from decimal import Decimal
 import pytest
 
 from arbbot.fees.schedule import (
+    BASE_MAKER_RATE,
+    BASE_TAKER_RATE,
     GENERAL_TRADING_FEE,
-    KALSHI_2022_SCHEDULE,
+    INDEX_TRADING_FEE,
+    KALSHI_SCHEDULE,
     FeeRule,
     FeeSchedule,
+    Liquidity,
     UnknownFeeError,
     UnverifiedFeeError,
 )
+from arbbot.money import ZERO
 
 D = Decimal
 TICKER = "KXHIGHTATL-26AUG13-T92"
@@ -110,21 +121,21 @@ class TestBaskets:
         """Rounding is per trade. Pricing a basket as one notional trade would
         understate it by most of its cost at small size."""
         legs = [(f"LEG{i}", D("0.01")) for i in range(6)]
-        assert KALSHI_2022_SCHEDULE.basket_fee(legs, D("1")) == D("0.06")
+        assert KALSHI_SCHEDULE.basket_fee(legs, D("1")) == D("0.06")
 
     def test_a_six_leg_basket_has_a_six_cent_floor(self) -> None:
         """The structural fact that decides most of this. A basket whose gross
         edge is under six cents cannot survive at one contract, no matter how
         attractive the price looks."""
         legs = [(f"LEG{i}", D("0.01")) for i in range(6)]
-        floor = KALSHI_2022_SCHEDULE.basket_fee(legs, D("1"))
+        floor = KALSHI_SCHEDULE.basket_fee(legs, D("1"))
         assert floor == D("0.06")
 
     def test_the_floor_amortises_with_size(self) -> None:
         """Ten times the size is nowhere near ten times the fee at a penny."""
         legs = [(f"LEG{i}", D("0.01")) for i in range(6)]
-        one = KALSHI_2022_SCHEDULE.basket_fee(legs, D("1"))
-        ten = KALSHI_2022_SCHEDULE.basket_fee(legs, D("10"))
+        one = KALSHI_SCHEDULE.basket_fee(legs, D("1"))
+        ten = KALSHI_SCHEDULE.basket_fee(legs, D("10"))
         assert ten < one * 10
 
     def test_a_real_basket_from_the_archive(self) -> None:
@@ -138,7 +149,7 @@ class TestBaskets:
             ("PHIL-E", D("0.01")),
             ("PHIL-F", D("0.01")),
         ]
-        fee = KALSHI_2022_SCHEDULE.basket_fee(legs, D("4"))
+        fee = KALSHI_SCHEDULE.basket_fee(legs, D("4"))
         # Five pennies plus ceil(0.07 * 4 * 0.79 * 0.21) = 0.05
         assert fee == D("0.10")
 
@@ -154,7 +165,8 @@ class TestUnknownFees:
     def test_a_rule_not_yet_in_force_does_not_apply(self) -> None:
         future = FeeRule(
             name="future",
-            rate=D("0.07"),
+            multiplier=D("1"),
+            maker_multiplier=ZERO,
             source="test",
             effective_from=dt.date(2030, 1, 1),
             verified=True,
@@ -162,34 +174,90 @@ class TestUnknownFees:
         with pytest.raises(UnknownFeeError):
             FeeSchedule((future,)).trade_fee(TICKER, D("0.50"), D("1"), on=dt.date(2026, 8, 13))
 
+    def test_an_unestablished_maker_fee_raises_rather_than_being_free(self) -> None:
+        """The FR-010 trap in its most tempting form. A maker fee nobody has
+        looked up is not zero, and defaulting it to zero would make resting
+        orders look costless on exactly the series most likely to charge for
+        them."""
+        with pytest.raises(UnknownFeeError, match="unknown_fee"):
+            INDEX_TRADING_FEE.fee(D("0.50"), D("100"), liquidity=Liquidity.MAKER)
+
+
+class TestPublishedRanges:
+    """The venue's current published schedule quotes a fee *range* per series
+    for a hundred contracts. Reproducing all four endpoints confirms the
+    coefficient, the P x (1-P) shape and the round-up rule together -- which no
+    single quoted rate could, and which is why this is the verification."""
+
+    def test_the_standard_taker_range(self) -> None:
+        assert GENERAL_TRADING_FEE.fee(D("0.01"), D("100")) == D("0.07")
+        assert GENERAL_TRADING_FEE.fee(D("0.50"), D("100")) == D("1.75")
+
+    def test_the_maker_range_on_a_series_that_charges_one(self) -> None:
+        maker = FeeRule(
+            name="test-maker",
+            multiplier=D("1"),
+            maker_multiplier=D("1"),
+            source="Kalshi published fee schedule, non-standard series rows",
+            effective_from=dt.date(2022, 9, 12),
+            verified=True,
+        )
+        assert maker.fee(D("0.01"), D("100"), liquidity=Liquidity.MAKER) == D("0.02")
+        assert maker.fee(D("0.50"), D("100"), liquidity=Liquidity.MAKER) == D("0.44")
+
+    def test_making_is_a_quarter_the_cost_of_taking(self) -> None:
+        assert BASE_MAKER_RATE == BASE_TAKER_RATE / 4
+
+
+class TestLiquidity:
+    def test_a_basket_is_priced_as_a_taker_by_default(self) -> None:
+        """Assembling a basket means crossing the spread on every leg. A
+        resting order is not an arbitrage until it fills, so pricing the
+        default as a maker would zero out the entire fee model."""
+        legs = [(f"LEG{i}", D("0.50")) for i in range(6)]
+        assert KALSHI_SCHEDULE.basket_fee(legs, D("100")) == D("10.50")
+
+    def test_resting_orders_are_free_on_a_standard_series(self) -> None:
+        """A fact about the strategy space, not only about arithmetic: the
+        entire fee burden this system models is the price of immediacy."""
+        assert (
+            KALSHI_SCHEDULE.trade_fee(TICKER, D("0.50"), D("100"), liquidity=Liquidity.MAKER)
+            == ZERO
+        )
+
 
 class TestVerification:
-    def test_the_shipped_rule_is_not_verified(self) -> None:
-        """Transcribed from a 2022 regulatory filing. Whether it is still the
-        schedule in force is the owner's question, not this module's."""
-        assert GENERAL_TRADING_FEE.verified is False
+    def test_the_general_rule_is_verified(self) -> None:
+        """Confirmed on 2026-08-13 against the venue's published schedule,
+        whose hundred-contract range this formula reproduces exactly."""
+        assert GENERAL_TRADING_FEE.verified is True
 
-    def test_qualification_refuses_an_unverified_rule(self) -> None:
+    def test_qualification_now_prices_the_general_rule(self) -> None:
+        assert KALSHI_SCHEDULE.trade_fee(TICKER, D("0.50"), D("1"), require_verified=True) == D(
+            "0.02"
+        )
+
+    def test_qualification_still_refuses_the_unconfirmed_override(self) -> None:
+        """One rule being confirmed does not confirm the rest. The index
+        multiplier rests on the 2022 filing alone and was not among the
+        non-standard series read off the published schedule."""
+        assert INDEX_TRADING_FEE.verified is False
         with pytest.raises(UnverifiedFeeError, match="confirm it against"):
-            KALSHI_2022_SCHEDULE.trade_fee(TICKER, D("0.50"), D("1"), require_verified=True)
-
-    def test_research_may_use_an_unverified_rule(self) -> None:
-        """Estimating is allowed; qualifying is not."""
-        assert KALSHI_2022_SCHEDULE.trade_fee(TICKER, D("0.50"), D("1")) == D("0.02")
+            KALSHI_SCHEDULE.trade_fee("INXD-1", D("0.50"), D("1"), require_verified=True)
 
     def test_every_rule_cites_a_source(self) -> None:
-        for rule in (GENERAL_TRADING_FEE,):
+        for rule in (GENERAL_TRADING_FEE, INDEX_TRADING_FEE):
             assert rule.source
             assert rule.effective_from
 
 
 class TestOverrides:
     def test_index_markets_take_the_lower_rate(self) -> None:
-        general = KALSHI_2022_SCHEDULE.trade_fee("KXHIGHTATL-1", D("0.50"), D("100"))
-        index = KALSHI_2022_SCHEDULE.trade_fee("INXD-1", D("0.50"), D("100"))
+        general = KALSHI_SCHEDULE.trade_fee("KXHIGHTATL-1", D("0.50"), D("100"))
+        index = KALSHI_SCHEDULE.trade_fee("INXD-1", D("0.50"), D("100"))
         assert index < general
 
     def test_the_override_matches_the_published_index_table(self) -> None:
-        """0.035 x 100 x 0.5 x 0.5 = 0.875, and the filing's index table
-        agrees at half the general rate."""
-        assert KALSHI_2022_SCHEDULE.trade_fee("INXD-1", D("0.50"), D("100")) == D("0.88")
+        """Multiplier 0.5 on the base rate: 0.035 x 100 x 0.5 x 0.5 = 0.875,
+        and the filing's index table agrees at half the general rate."""
+        assert KALSHI_SCHEDULE.trade_fee("INXD-1", D("0.50"), D("100")) == D("0.88")

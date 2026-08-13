@@ -51,6 +51,22 @@ def cheap_basket(session: Session, at: dt.datetime = T0, ask: str = "0.20") -> N
         snap(session, leg, yes_ask=ask, at=at)
 
 
+def approve_the_test_basket(session: Session, legs: tuple[str, ...] = ("A", "B", "C")) -> None:
+    """Put a signed relationship behind the leg set, the way strict mode needs."""
+    from arbbot.registry import RelationshipRegistry
+    from arbbot.relationships import RelationshipType
+
+    registry = RelationshipRegistry(session)
+    record = registry.draft(
+        slug="test-partition",
+        relationship_type=RelationshipType.INTERVAL_PARTITION,
+        legs=[{"ticker": f"{EVENT}-{leg}"} for leg in legs],
+        payout_proof={"claim": "exactly one leg settles YES"},
+        dependency_hashes={f"{EVENT}-{leg}": "h" * 64 for leg in legs},
+    )
+    registry.approve(record, reviewer="tester", evidence="settlement terms read in test")
+
+
 class TestFunnel:
     def test_an_empty_archive_reports_nothing(self, session: Session) -> None:
         report = run_falsification(session)
@@ -113,14 +129,42 @@ class TestStalenessSweep:
 
 
 class TestStrictMode:
-    def test_strict_mode_refuses_unverified_fees(self, session: Session) -> None:
-        """A run that will not price on an unconfirmed fee rule is the honest
-        default for anything claiming to be tradeable."""
+    def test_strict_mode_refuses_a_leg_set_nobody_approved(self, session: Session) -> None:
+        """The gate that took over once fees were confirmed.
+
+        While the fee rule was unverified this died on ``unknown_fee`` and the
+        approval gate was never reached. Now that fees price, a strict run that
+        skipped the registry would report qualified candidates for leg sets no
+        reviewer has ever seen.
+        """
         cheap_basket(session)
         report = run_falsification(session, quantity=D("10"), research_mode=False)
 
         assert report.slices[0].accepted == 0
-        assert report.slices[0].dominant_reason == str(RejectionReason.UNKNOWN_FEE)
+        assert report.slices[0].dominant_reason == str(RejectionReason.RELATIONSHIP_NOT_APPROVED)
+
+    def test_strict_mode_prices_an_approved_leg_set(self, session: Session) -> None:
+        """And the gate opens when someone has actually signed for it."""
+        cheap_basket(session)
+        approve_the_test_basket(session)
+
+        report = run_falsification(session, quantity=D("10"), research_mode=False)
+        assert report.slices[0].accepted >= 1
+
+    def test_an_approval_covering_only_some_legs_does_not_qualify(self, session: Session) -> None:
+        """A basket missing an outcome pays nothing when that outcome occurs,
+        so the approved set must match exactly rather than merely overlap."""
+        cheap_basket(session)
+        approve_the_test_basket(session, legs=("A", "B"))
+
+        report = run_falsification(session, quantity=D("10"), research_mode=False)
+        assert report.slices[0].accepted == 0
+
+    def test_strict_mode_says_what_it_enforced(self, session: Session) -> None:
+        cheap_basket(session)
+        rendered = run_falsification(session, research_mode=False).render()
+        assert "STRICT MODE" in rendered
+        assert "approved relationship" in rendered
 
     def test_research_mode_is_declared_in_the_report(self, session: Session) -> None:
         cheap_basket(session)
@@ -132,7 +176,7 @@ class TestStrictMode:
         cheap_basket(session)
         rendered = run_falsification(session).render()
         assert "upper bound" in rendered
-        assert "unverified" in rendered
+        assert "taker fees" in rendered
 
 
 class TestShadowExecution:

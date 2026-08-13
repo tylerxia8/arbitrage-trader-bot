@@ -316,9 +316,10 @@ class TestReporting:
     def test_report_states_that_nothing_is_tradeable(self, session: Session) -> None:
         full_set(session, ["0.30", "0.30", "0.30"])
         rendered = scan_baskets(session).render()
-        assert "ESTIMATED" in rendered
-        assert "refuses to qualify" in rendered
-        assert "no relationship here has been approved" in rendered
+        assert "TAKER" in rendered
+        assert "Slippage, latency and capital" in rendered
+        assert "no" in rendered
+        assert "relationship here has been approved" in rendered
 
     def test_an_empty_scan_says_so_plainly(self, session: Session) -> None:
         assert "nothing priced below its payout" in scan_baskets(session).render()

@@ -21,6 +21,14 @@ mode prices structurally-discovered partitions as if approved, which answers
 "would anything qualify if a reviewer signed" while stating plainly that
 nobody has.
 
+That distinction only became load-bearing once the fee rule was confirmed.
+Before then ``research_mode`` had a single consequence -- whether an unverified
+fee could price at all -- so a strict run died on ``unknown_fee`` and never
+reached the approval gate. With the general taker rule now verified against the
+venue's published schedule, a strict run that did not consult the registry
+would report qualified candidates for leg sets nobody has signed for, which is
+exactly the claim FR-005 exists to prevent. So it consults it.
+
 **The staleness sweep is the honest way to report a polled archive.** The
 detector's threshold is two seconds; polled books are 0-30 seconds old, so a
 strict run rejects everything on quote age. Reporting only that would hide
@@ -43,11 +51,13 @@ from sqlalchemy.orm import Session
 from arbbot.analysis.baskets import event_of
 from arbbot.db.models import BookSnapshot
 from arbbot.detector import BasketRequest, evaluate_basket
-from arbbot.fees import KALSHI_2022_SCHEDULE, FeeSchedule
+from arbbot.fees import KALSHI_SCHEDULE, FeeSchedule
 from arbbot.ledger import CapitalLedger
 from arbbot.marketdata.book import OrderBook
 from arbbot.marketdata.types import BookSide, PriceLevel
 from arbbot.money import PAYOUT_DOLLARS, ZERO
+from arbbot.reasons import RejectionReason
+from arbbot.registry import RelationshipRegistry
 from arbbot.shadow import ShadowConfig, simulate_basket
 
 __all__ = ["FalsificationReport", "StalenessSlice", "run_falsification"]
@@ -108,6 +118,11 @@ class FalsificationReport:
             lines.append("RESEARCH MODE: relationships are priced as if approved. None are.")
             lines.append("No candidate below is tradeable, and no reviewer has signed for any")
             lines.append("of these leg sets being mutually exclusive and collectively exhaustive.")
+        else:
+            lines.append("")
+            lines.append("STRICT MODE: only leg sets an approved relationship covers exactly")
+            lines.append("were priced, and only on a fee rule confirmed against the venue's")
+            lines.append("published schedule. Everything else is counted as rejected.")
 
         for slice_ in self.slices:
             age = slice_.max_age.total_seconds()
@@ -130,9 +145,10 @@ class FalsificationReport:
                 lines.append(f"  unwind losses             : ${slice_.unwind_losses:.2f}")
 
         lines.append("")
-        lines.append("Fees are estimated from an unverified 2022 filing. Shadow execution")
-        lines.append("omits queue position, venue rejections, and market impact -- all of")
-        lines.append("which make reality worse, so these figures are an upper bound.")
+        lines.append("Fees are taker fees on the confirmed general rule, which is what")
+        lines.append("assembling a basket costs: every leg crosses the spread. Shadow")
+        lines.append("execution omits queue position, venue rejections, and market impact")
+        lines.append("-- all of which make reality worse, so these figures are an upper bound.")
         return "\n".join(lines)
 
 
@@ -154,7 +170,7 @@ def run_falsification(
     *,
     quantity: Decimal = Decimal("10"),
     min_net_edge: Decimal = ZERO,
-    fees: FeeSchedule = KALSHI_2022_SCHEDULE,
+    fees: FeeSchedule = KALSHI_SCHEDULE,
     staleness_thresholds: tuple[dt.timedelta, ...] = (
         dt.timedelta(seconds=2),
         dt.timedelta(seconds=30),
@@ -184,6 +200,24 @@ def run_falsification(
     for ticker, *_ in rows:
         legs_by_event.setdefault(event_of(ticker), set()).add(ticker)
 
+    # Strict mode consults the registry for real. Until the fee rule was
+    # confirmed, ``research_mode`` had only one consequence -- whether an
+    # unverified fee could price -- so a strict run rejected everything on
+    # ``unknown_fee`` and the approval gate was never exercised. With fees now
+    # verified, a strict run that skipped this check would report qualified
+    # candidates for leg sets nobody has signed for, which is precisely the
+    # claim FR-005 exists to prevent.
+    #
+    # Keyed on the terms hashes because those record the exact legs the
+    # reviewer read. A basket missing an outcome pays nothing when that outcome
+    # occurs, so the approved set must match exactly, not merely contain.
+    approved_leg_sets: set[frozenset[str]] = set()
+    if not research_mode:
+        approved_leg_sets = {
+            frozenset(record.dependency_hashes)
+            for record in RelationshipRegistry(session).approved()
+        }
+
     report = FalsificationReport(
         events_seen=len(legs_by_event),
         snapshots_read=len(rows),
@@ -207,6 +241,11 @@ def run_falsification(
             event = event_of(ticker)
             legs = legs_by_event[event]
             if len(legs) < 2 or not legs <= latest.keys():
+                continue
+
+            if not research_mode and frozenset(legs) not in approved_leg_sets:
+                slice_.evaluated += 1
+                slice_.rejections[str(RejectionReason.RELATIONSHIP_NOT_APPROVED)] += 1
                 continue
 
             books = {leg: latest[leg][0] for leg in legs}

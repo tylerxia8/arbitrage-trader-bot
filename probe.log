@@ -1,0 +1,8 @@
+﻿.\.venv\Scripts\python.exe : 2026-08-13 18:22:09 INFO    115 cycles over 2m: 77 books archived, 613 unchanged, 0 
+failed, 6 markets
+At line:3 char:1
++ .\.venv\Scripts\python.exe -m arbbot.cli probe --interval 1 --event K ...
++ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (2026-08-13 18:2...iled, 6 markets:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
