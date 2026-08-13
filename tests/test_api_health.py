@@ -113,8 +113,10 @@ class TestStaleSamples:
         session.add(sample(healthy=True, observed=T0))
         session.flush()
 
+        # Five minutes: past the two-minute silence threshold, but still inside
+        # the retirement window, so the stream is judged rather than dropped.
         payload = health_module.build_health_payload(
-            session, settings(), now=T0 + dt.timedelta(minutes=10)
+            session, settings(), now=T0 + dt.timedelta(minutes=5)
         )
         assert payload["healthy"] is False
         assert payload["streams"][0]["sample_is_stale"] is True
@@ -139,6 +141,41 @@ class TestStaleSamples:
         )
         assert len(payload["streams"]) == 1
         assert payload["healthy"] is True
+
+
+class TestRetiredStreams:
+    def test_a_settled_market_drops_out_of_the_report(self, session: Session) -> None:
+        """Daily markets settle overnight. Without this every market ever
+        collected stays in the report permanently stale, and the deployment
+        reads unhealthy forever on the strength of expired contracts."""
+        session.add(sample(key="orderbook_poll:YESTERDAY", healthy=True, observed=T0))
+        session.add(
+            sample(
+                key="orderbook_poll:TODAY",
+                healthy=True,
+                observed=T0 + dt.timedelta(days=1),
+            )
+        )
+        session.flush()
+
+        payload = health_module.build_health_payload(
+            session, settings(), now=T0 + dt.timedelta(days=1, seconds=30)
+        )
+        keys = {s["subscription_key"] for s in payload["streams"]}
+        assert keys == {"orderbook_poll:TODAY"}
+        assert payload["healthy"] is True
+
+    def test_a_stopped_collector_is_still_caught(self, session: Session) -> None:
+        """Retiring streams must not hide a dead collector: when every stream
+        falls outside the window the list is empty, and empty is unhealthy."""
+        session.add(sample(healthy=True, observed=T0))
+        session.flush()
+
+        payload = health_module.build_health_payload(
+            session, settings(), now=T0 + dt.timedelta(hours=2)
+        )
+        assert payload["streams"] == []
+        assert payload["healthy"] is False
 
 
 class TestPayload:

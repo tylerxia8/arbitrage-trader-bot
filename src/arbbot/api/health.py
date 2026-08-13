@@ -33,14 +33,27 @@ __all__ = ["build_health_payload", "router"]
 router = APIRouter(tags=["health"])
 
 
-def _latest_samples(session: Session) -> list[FeedHealth]:
-    """The most recent health sample per stream.
+def _latest_samples(session: Session, *, since: dt.datetime) -> list[FeedHealth]:
+    """The most recent health sample per stream, for streams still reporting.
 
-    Ordered newest-first and de-duplicated in Python rather than with a window
-    function, because this runs on a handful of streams and portability across
-    SQLite fixtures and PostgreSQL is worth more here than elegance.
+    ``since`` excludes retired streams. The collection universe is daily
+    markets that settle overnight, so without this every market ever collected
+    stays in the report for good, permanently stale, and the deployment reads
+    unhealthy forever on the strength of contracts that expired last week.
+
+    A stream that stopped because its market ended is not a fault. A collector
+    that stopped entirely still shows up: every stream falls outside the
+    window, the list comes back empty, and an empty list is unhealthy.
+
+    De-duplicated in Python rather than with a window function -- this runs on
+    a hundred-odd streams, and portability across the SQLite fixtures and
+    PostgreSQL is worth more here than elegance.
     """
-    rows = session.execute(select(FeedHealth).order_by(FeedHealth.observed_ts.desc())).scalars()
+    rows = session.execute(
+        select(FeedHealth)
+        .where(FeedHealth.observed_ts >= since)
+        .order_by(FeedHealth.observed_ts.desc())
+    ).scalars()
     latest: dict[str, FeedHealth] = {}
     for row in rows:
         latest.setdefault(row.subscription_key, row)
@@ -56,7 +69,10 @@ def build_health_payload(
 ) -> dict[str, Any]:
     """Assemble the health document and decide whether the system is healthy."""
     at = now or utc_now()
-    samples = _latest_samples(session)
+    # A generous multiple of the silence threshold: wide enough that a stream
+    # briefly behind is still judged rather than quietly dropped, narrow enough
+    # that yesterday's settled markets fall out of the picture.
+    samples = _latest_samples(session, since=at - (max_silence * 4))
 
     streams: list[dict[str, Any]] = []
     for sample in samples:

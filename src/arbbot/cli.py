@@ -77,6 +77,7 @@ def _doctor() -> int:
 def _collect(tickers: list[str], poll_interval: float, use_universe: bool) -> int:
     """Run the polling collector until interrupted."""
     import asyncio
+    import logging
 
     from arbbot.collection.service import CollectionService
     from arbbot.db.session import session_factory
@@ -89,6 +90,21 @@ def _collect(tickers: list[str], poll_interval: float, use_universe: bool) -> in
         print("configuration          : INVALID", file=sys.stderr)
         print(exc, file=sys.stderr)
         return 2
+
+    # Without this the service's progress heartbeat goes nowhere, and a
+    # seven-day run shows three startup lines and then silence.
+    logging.basicConfig(
+        level=settings.log_level,
+        format="%(asctime)s %(levelname)-7s %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+    # httpx logs every request at INFO. At 120 markets on a 30-second cycle
+    # that is 240 lines a minute -- roughly 350,000 a day, which buries the
+    # heartbeat completely and churns through the container's log cap in about
+    # two days. The requests are not interesting; the failures are, and those
+    # still come through at WARNING.
+    for noisy in ("httpx", "httpcore"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
 
     async def run() -> None:
         engine = create_engine_from_settings(settings)
@@ -134,6 +150,29 @@ def _collect(tickers: list[str], poll_interval: float, use_universe: bool) -> in
     return 0
 
 
+def _serve(host: str, port: int) -> int:
+    """Serve the read-only operator API.
+
+    The ``/health`` endpoint existed and was tested from the first day of this
+    milestone, and nothing ran it -- a monitored endpoint nobody can reach is
+    indistinguishable from no monitoring.
+    """
+    import uvicorn
+
+    from arbbot.api.app import create_app
+
+    try:
+        settings = load_settings()
+    except ValidationError as exc:
+        print("configuration          : INVALID", file=sys.stderr)
+        print(exc, file=sys.stderr)
+        return 2
+
+    print(f"serving read-only API on http://{host}:{port}/health")
+    uvicorn.run(create_app(settings), host=host, port=port, log_level=settings.log_level.lower())
+    return 0
+
+
 def _coverage() -> int:
     """Report continuous-collection coverage against the M1 exit gate."""
     from arbbot.collection.coverage import assess_coverage
@@ -165,6 +204,10 @@ def main(argv: list[str] | None = None) -> int:
         "coverage", help="report continuous-collection coverage against the M1 exit gate"
     )
 
+    serve = subparsers.add_parser("serve", help="serve the read-only operator API (/health)")
+    serve.add_argument("--host", default="127.0.0.1", help="bind address (default: loopback)")
+    serve.add_argument("--port", type=int, default=8000)
+
     collect = subparsers.add_parser("collect", help="poll public order books and archive them")
     collect.add_argument(
         "tickers", nargs="*", help="market tickers to collect (omit with --universe)"
@@ -186,6 +229,8 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.command == "doctor":
         return _doctor()
+    if args.command == "serve":
+        return _serve(args.host, args.port)
     if args.command == "coverage":
         return _coverage()
     if args.command == "collect":

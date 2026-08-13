@@ -73,5 +73,24 @@ services:
         max-size: "20m"
         max-file: "5"
 
+  # Read-only operator API, started alongside the collector by the same
+  # profile. Bound to localhost on the host side: it is a monitoring view of a
+  # research deployment, not something to expose.
+  health:
+    build:
+      context: .
+    profiles: ["collect"]
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      ARBBOT_ENVIRONMENT: research
+      ARBBOT_DATABASE_URL: postgresql+psycopg://arbbot:arbbot@db:5432/arbbot
+      ARBBOT_LOG_LEVEL: WARNING
+    command: ["serve", "--host", "0.0.0.0", "--port", "8000"]
+    ports:
+      - "127.0.0.1:8000:8000"
+    restart: unless-stopped
+
 volumes:
   pgdata:

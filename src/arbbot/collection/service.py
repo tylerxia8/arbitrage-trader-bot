@@ -28,6 +28,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import datetime as dt
+import logging
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
 
@@ -39,6 +40,26 @@ from arbbot.venues.kalshi import KalshiAdapter
 from arbbot.venues.kalshi.rest import KalshiRestClient
 
 __all__ = ["CollectionService", "CycleReport", "MarketSource", "RefreshReport"]
+
+_log = logging.getLogger(__name__)
+
+
+@dataclass(slots=True)
+class _Tally:
+    """Running totals between progress reports."""
+
+    cycles: int = 0
+    stored: int = 0
+    unchanged: int = 0
+    failed: int = 0
+
+
+def _humanise(delta: dt.timedelta) -> str:
+    minutes = int(delta.total_seconds() // 60)
+    if minutes < 60:
+        return f"{minutes}m"
+    return f"{minutes // 60}h{minutes % 60:02d}m"
+
 
 #: Resolves the currently-live market tickers. Async because it hits the venue.
 MarketSource = Callable[[], Awaitable[Sequence[str]]]
@@ -94,6 +115,7 @@ class CollectionService:
         adapter: KalshiAdapter | None = None,
         market_source: MarketSource | None = None,
         refresh_interval_seconds: float = 900.0,
+        progress_interval_seconds: float = 600.0,
     ) -> None:
         """
         :param market_source: called periodically to re-resolve the live
@@ -124,6 +146,9 @@ class CollectionService:
         # ladder, and every other market's sampling cadence slips with it.
         self.collectors = [self._make_collector(ticker) for ticker in tickers]
         self._last_health_sample: dt.datetime | None = None
+        self._progress_interval = progress_interval_seconds
+        self._last_progress = utc_now()
+        self._since_progress = _Tally()
 
     def _make_collector(self, ticker: str) -> MarketCollector:
         return MarketCollector(
@@ -217,6 +242,53 @@ class CollectionService:
             return True
         return (at - self._last_health_sample).total_seconds() >= self._health_interval
 
+    def _log_progress(self, report: CycleReport, at: dt.datetime) -> None:
+        """Emit a periodic summary.
+
+        A seven-day run is 20,000 cycles. Logging each one buries anything
+        worth seeing; logging none of them leaves an operator with three
+        startup lines and no way to tell a working collector from a wedged
+        one. So: a heartbeat on a timer, plus anything unusual immediately.
+        """
+        if report.refresh is not None and (report.refresh.changed or report.refresh.failed):
+            if report.refresh.failed:
+                _log.warning("market refresh failed: %s", report.refresh.failed)
+            else:
+                _log.info(
+                    "markets rotated: +%d -%d (now %d)",
+                    len(report.refresh.added),
+                    len(report.refresh.removed),
+                    len(self.collectors),
+                )
+
+        if report.all_failed:
+            _log.error("every market failed this cycle: %s", "; ".join(report.errors[:3]))
+        elif report.failed:
+            _log.warning(
+                "%d of %d markets failed: %s", report.failed, report.polled, report.errors[0]
+            )
+
+        self._since_progress.stored += report.stored
+        self._since_progress.unchanged += report.unchanged
+        self._since_progress.failed += report.failed
+        self._since_progress.cycles += 1
+
+        if (at - self._last_progress).total_seconds() < self._progress_interval:
+            return
+
+        tally = self._since_progress
+        _log.info(
+            "%d cycles over %s: %d books archived, %d unchanged, %d failed, %d markets",
+            tally.cycles,
+            _humanise(at - self._last_progress),
+            tally.stored,
+            tally.unchanged,
+            tally.failed,
+            len(self.collectors),
+        )
+        self._since_progress = _Tally()
+        self._last_progress = at
+
     async def run_forever(self, *, stop: asyncio.Event | None = None) -> None:
         """Collect until cancelled or ``stop`` is set.
 
@@ -229,7 +301,8 @@ class CollectionService:
         loop = asyncio.get_running_loop()
         while stop is None or not stop.is_set():
             started = loop.time()
-            await self.run_cycle()
+            report = await self.run_cycle()
+            self._log_progress(report, utc_now())
             elapsed = loop.time() - started
             delay = max(0.0, self._poll_interval - elapsed)
 
