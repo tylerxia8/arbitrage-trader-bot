@@ -134,21 +134,45 @@ class TestCapacity:
         assert observation.max_contracts == D("4")
         assert observation.gross_dollars == D("0.64")
 
-    def test_best_ranks_by_dollars_not_by_price(self, session: Session) -> None:
-        """Ranking by price alone puts the four-contract curiosity on top."""
+    def test_size_does_not_rescue_a_thin_edge(self, session: Session) -> None:
+        """The economics that decide this whole strategy.
+
+        The fee is proportional to size, so size never amortises it away --
+        only the per-trade rounding floor shrinks. What must clear the fee is
+        the edge *per basket*.
+
+        Here the deep basket has $36 of gross edge across 900 contracts and
+        still loses $5.13, because at $0.32 a contract the fee is 1.47 cents
+        per contract per leg and the edge is only 4 cents across three legs.
+        The four-contract basket, with a 10-cent edge, keeps 22 cents.
+        """
         snap(session, "L0", yes_ask="0.30", size="4", at=T0)
         snap(session, "L1", yes_ask="0.30", size="4", at=T0)
         snap(session, "L2", yes_ask="0.30", size="4", at=T0)
+
+        # Back above payout in between, so these are two separate episodes
+        # rather than one continuous stretch of cheapness.
+        between = T0 + dt.timedelta(minutes=5)
+        snap(session, "L0", yes_ask="0.40", size="10", at=between)
+        snap(session, "L1", yes_ask="0.40", size="10", at=between)
+        snap(session, "L2", yes_ask="0.40", size="10", at=between)
 
         later = T0 + dt.timedelta(minutes=10)
         snap(session, "L0", yes_ask="0.32", size="900", at=later)
         snap(session, "L1", yes_ask="0.32", size="900", at=later)
         snap(session, "L2", yes_ask="0.32", size="900", at=later)
 
+        episodes = {e.best_cost: e for e in scan_baskets(session).episodes}
+        deep = episodes[D("0.96")]
+        thin = episodes[D("0.90")]
+
+        assert deep.best_dollars == D("36.00")
+        assert deep.best_net == D("-5.13"), "gross size is not profit"
+        assert thin.best_net == D("0.22")
+
         best = scan_baskets(session).best
         assert best is not None
-        assert best.best_cost == D("0.96")  # the dearer basket, but the deeper one
-        assert best.max_contracts == D("900")
+        assert best.best_cost == D("0.90"), "ranked on what survives fees"
 
 
 class TestCompleteness:
@@ -223,8 +247,9 @@ class TestReporting:
     def test_report_states_that_nothing_is_tradeable(self, session: Session) -> None:
         full_set(session, ["0.30", "0.30", "0.30"])
         rendered = scan_baskets(session).render()
-        assert "Fees are unmodelled" in rendered
-        assert "Nothing above is tradeable" in rendered
+        assert "ESTIMATED" in rendered
+        assert "refuses to qualify" in rendered
+        assert "no relationship here has been approved" in rendered
 
     def test_an_empty_scan_says_so_plainly(self, session: Session) -> None:
         assert "nothing priced below its payout" in scan_baskets(session).render()

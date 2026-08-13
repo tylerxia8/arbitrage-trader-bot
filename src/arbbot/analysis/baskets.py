@@ -39,6 +39,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from arbbot.db.models import BookSnapshot
+from arbbot.fees import KALSHI_2022_SCHEDULE, FeeSchedule
 from arbbot.money import PAYOUT_DOLLARS, ZERO
 
 __all__ = [
@@ -97,6 +98,14 @@ class BasketObservation:
     max_contracts: Decimal
     """Smallest depth across the legs -- the basket cannot exceed it."""
 
+    fee: Decimal = ZERO
+    """Estimated venue fee at ``max_contracts``, summed per leg.
+
+    Estimated, not authoritative: the rule is transcribed from a 2022
+    regulatory filing and nobody has confirmed it is still in force, so
+    :mod:`arbbot.fees` refuses to qualify anything on it.
+    """
+
     @property
     def gross_edge(self) -> Decimal:
         """Per-basket discount to the payout. Gross: no fees, no slippage."""
@@ -104,11 +113,19 @@ class BasketObservation:
 
     @property
     def gross_dollars(self) -> Decimal:
-        """What the whole thing is worth at the depth available.
-
-        The number that matters, and the one that deflates most of these.
-        """
+        """What the whole thing is worth at the depth available."""
         return self.gross_edge * self.max_contracts
+
+    @property
+    def net_dollars(self) -> Decimal:
+        """Gross less the estimated fee. Still before slippage and latency.
+
+        This is the number that decides things, and it is usually negative.
+        The fee rounds up to a cent per leg, so a six-leg basket pays at least
+        six cents however small it is -- which is more than most of these are
+        worth in total.
+        """
+        return self.gross_dollars - self.fee
 
 
 @dataclass(slots=True)
@@ -133,6 +150,7 @@ class BasketEpisode:
     legs: int
     best_cost: Decimal
     best_dollars: Decimal
+    best_net: Decimal
     max_contracts: Decimal
     observations: int = 1
 
@@ -158,13 +176,13 @@ class ScanResult:
 
     @property
     def best(self) -> BasketEpisode | None:
-        """Largest gross dollars, not the lowest price.
+        """Largest net dollars, not the lowest price.
 
         A cheap basket nobody can size into is worth less than a dear one with
         depth, and ranking by price alone puts the four-contract curiosity at
         the top of the report.
         """
-        return max(self.episodes, key=lambda e: e.best_dollars, default=None)
+        return max(self.episodes, key=lambda e: e.best_net, default=None)
 
     def render(self, limit: int = 15) -> str:
         lines = [
@@ -179,26 +197,35 @@ class ScanResult:
             lines.append("nothing priced below its payout.")
             return "\n".join(lines)
 
+        survivors = [e for e in self.episodes if e.best_net > ZERO]
+        lines.append(f"still positive after fees  : {len(survivors):,}")
+
         lines.append("")
-        header_dollars = "gross $"
+        gross_header, net_header = "gross $", "net $"
         lines.append(
-            f"{'event':<26} {'legs':>4} {'best':>8} {'edge':>7} "
-            f"{'size':>8} {header_dollars:>9} {'lasted':>8}  first seen"
+            f"{'event':<26} {'legs':>4} {'best':>8} {'size':>8} "
+            f"{gross_header:>8} {net_header:>8} {'lasted':>8}  first seen"
         )
         lines.append("-" * 92)
-        for ep in sorted(self.episodes, key=lambda e: -e.best_dollars)[:limit]:
+        for ep in sorted(self.episodes, key=lambda e: -e.best_net)[:limit]:
             lines.append(
-                f"{ep.event:<26} {ep.legs:>4} ${ep.best_cost:>7} ${ep.best_edge:>6} "
-                f"{ep.max_contracts:>8} ${ep.best_dollars:>8.2f} "
+                f"{ep.event:<26} {ep.legs:>4} ${ep.best_cost:>7} {ep.max_contracts:>8} "
+                f"${ep.best_dollars:>7.2f} ${ep.best_net:>7.2f} "
                 f"{_duration(ep.duration):>8}  {ep.first_seen:%Y-%m-%d %H:%M:%S}"
             )
 
-        total = sum((e.best_dollars for e in self.episodes), ZERO)
+        gross_total = sum((e.best_dollars for e in self.episodes), ZERO)
+        net_total = sum((e.best_net for e in self.episodes), ZERO)
+        positive = sum((e.best_net for e in survivors), ZERO)
         lines.append("")
-        lines.append(f"sum of every episode at its best, gross: ${total:.2f}")
+        lines.append(f"every episode at its best, gross : ${gross_total:>8.2f}")
+        lines.append(f"                          net    : ${net_total:>8.2f}")
+        lines.append(f"only the ones still positive     : ${positive:>8.2f}")
         lines.append("")
-        lines.append("Gross figures. Fees are unmodelled, only the best price level is used,")
-        lines.append("and no relationship here has been approved. Nothing above is tradeable.")
+        lines.append("Fees are ESTIMATED from a 2022 regulatory filing that nobody has")
+        lines.append("confirmed is still in force; arbbot.fees refuses to qualify on it.")
+        lines.append("Slippage, latency and capital cost are not modelled. Only the best")
+        lines.append("price level is used, and no relationship here has been approved.")
         return "\n".join(lines)
 
 
@@ -214,6 +241,7 @@ def scan_baskets(
     *,
     max_leg_age: dt.timedelta = DEFAULT_MAX_LEG_AGE,
     since: dt.datetime | None = None,
+    fees: FeeSchedule = KALSHI_2022_SCHEDULE,
 ) -> ScanResult:
     """Walk the archive and record every full, fresh set priced below payout."""
     stmt = select(
@@ -269,12 +297,14 @@ def scan_baskets(
             open_episodes.pop(event, None)
             continue
 
+        size = min(s for _, s, _ in quotes)
         observation = BasketObservation(
             event=event,
             observed_ts=captured,
             legs=len(legs),
             cost=cost,
-            max_contracts=min(size for _, size, _ in quotes),
+            max_contracts=size,
+            fee=fees.basket_fee([(leg, latest[leg][0]) for leg in legs], size),
         )
         result.observations.append(observation)
 
@@ -287,6 +317,7 @@ def scan_baskets(
                 legs=observation.legs,
                 best_cost=observation.cost,
                 best_dollars=observation.gross_dollars,
+                best_net=observation.net_dollars,
                 max_contracts=observation.max_contracts,
             )
             open_episodes[event] = episode
@@ -294,7 +325,10 @@ def scan_baskets(
         else:
             episode.last_seen = captured
             episode.observations += 1
-            if observation.gross_dollars > episode.best_dollars:
+            if observation.net_dollars > episode.best_net:
+                # Ranked on net, not gross: the best moment of an episode is
+                # the one that survives its fees, not the cheapest headline.
+                episode.best_net = observation.net_dollars
                 episode.best_dollars = observation.gross_dollars
                 episode.best_cost = observation.cost
                 episode.max_contracts = observation.max_contracts
