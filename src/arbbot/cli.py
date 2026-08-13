@@ -199,6 +199,28 @@ def _baskets(max_age_seconds: float, limit: int) -> int:
     return 0
 
 
+def _falsify(quantity: str, research: bool) -> int:
+    """Replay the archive through the detector and report where candidates die."""
+    from decimal import Decimal
+
+    from arbbot.analysis.falsification import run_falsification
+    from arbbot.db.session import session_factory
+
+    try:
+        settings = load_settings()
+    except ValidationError as exc:
+        print("configuration          : INVALID", file=sys.stderr)
+        print(exc, file=sys.stderr)
+        return 2
+
+    engine = create_engine_from_settings(settings)
+    with session_factory(engine)() as session:
+        report = run_falsification(session, quantity=Decimal(quantity), research_mode=research)
+
+    print(report.render())
+    return 0
+
+
 def _coverage() -> int:
     """Report continuous-collection coverage against the M1 exit gate."""
     from arbbot.collection.coverage import assess_coverage
@@ -243,6 +265,19 @@ def main(argv: list[str] | None = None) -> int:
     )
     baskets.add_argument("--limit", type=int, default=15, help="rows to show")
 
+    falsify = subparsers.add_parser(
+        "falsify", help="replay the archive through the detector and report the funnel"
+    )
+    falsify.add_argument(
+        "--quantity", default="10", help="basket size to price (default: 10 contracts)"
+    )
+    falsify.add_argument(
+        "--strict",
+        action="store_true",
+        help="require approved relationships and verified fees; without it the run "
+        "prices structurally-discovered sets as if approved, and says so",
+    )
+
     serve = subparsers.add_parser("serve", help="serve the read-only operator API (/health)")
     serve.add_argument("--host", default="127.0.0.1", help="bind address (default: loopback)")
     serve.add_argument("--port", type=int, default=8000)
@@ -272,6 +307,8 @@ def main(argv: list[str] | None = None) -> int:
         return _serve(args.host, args.port)
     if args.command == "baskets":
         return _baskets(args.max_leg_age, args.limit)
+    if args.command == "falsify":
+        return _falsify(args.quantity, not args.strict)
     if args.command == "coverage":
         return _coverage()
     if args.command == "collect":

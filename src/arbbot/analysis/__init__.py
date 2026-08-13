@@ -8,5 +8,12 @@ worth the milestones that follow.
 from __future__ import annotations
 
 from arbbot.analysis.baskets import BasketObservation, ScanResult, scan_baskets
+from arbbot.analysis.falsification import FalsificationReport, run_falsification
 
-__all__ = ["BasketObservation", "ScanResult", "scan_baskets"]
+__all__ = [
+    "BasketObservation",
+    "FalsificationReport",
+    "ScanResult",
+    "run_falsification",
+    "scan_baskets",
+]
