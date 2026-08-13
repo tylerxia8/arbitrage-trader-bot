@@ -93,6 +93,7 @@ Milestone 0 the answer is always no, because the live path is not compiled in.
 | [docs/adr/](docs/adr/) | Architecture decision records |
 | [src/arbbot/venues/kalshi/](src/arbbot/venues/kalshi/) | Kalshi adapter: parser + public REST client |
 | [docs/venue-findings.md](docs/venue-findings.md) | Verified venue behaviour and open decisions |
+| [docs/market-selection.md](docs/market-selection.md) | Which markets to collect, and why the obvious filter is a trap |
 | [docs/threat-model.md](docs/threat-model.md) | Threat model |
 
 ## Stack
