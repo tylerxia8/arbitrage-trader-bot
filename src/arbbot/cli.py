@@ -173,7 +173,9 @@ def _serve(host: str, port: int) -> int:
     return 0
 
 
-def _baskets(max_age_seconds: float, limit: int) -> int:
+def _baskets(
+    max_age_seconds: float, limit: int, event: str | None, since_hours: float | None
+) -> int:
     """Report moments when a full leg set priced below its payout.
 
     Research, not detection: no relationship here is approved, fees are
@@ -193,7 +195,17 @@ def _baskets(max_age_seconds: float, limit: int) -> int:
 
     engine = create_engine_from_settings(settings)
     with session_factory(engine)() as session:
-        result = scan_baskets(session, max_leg_age=dt.timedelta(seconds=max_age_seconds))
+        since = (
+            dt.datetime.now(dt.UTC) - dt.timedelta(hours=since_hours)
+            if since_hours is not None
+            else None
+        )
+        result = scan_baskets(
+            session,
+            max_leg_age=dt.timedelta(seconds=max_age_seconds),
+            since=since,
+            event=event,
+        )
 
     print(result.render(limit=limit))
     return 0
@@ -340,6 +352,20 @@ def main(argv: list[str] | None = None) -> int:
         "(default: 60). Loosening this manufactures edges from quotes that never coexisted.",
     )
     baskets.add_argument("--limit", type=int, default=15, help="rows to show")
+    baskets.add_argument(
+        "--event",
+        default=None,
+        help="restrict the scan to one event ticker, e.g. KXHIGHTDAL-26AUG14. Use this to "
+        "read the fast-poll probe on its own: mixing a one-second stream with the "
+        "thirty-second collector averages a measured duration with an unmeasured one.",
+    )
+    baskets.add_argument(
+        "--since-hours",
+        type=float,
+        default=None,
+        metavar="HOURS",
+        help="only scan the last N hours",
+    )
 
     probe = subparsers.add_parser(
         "probe",
@@ -393,7 +419,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "serve":
         return _serve(args.host, args.port)
     if args.command == "baskets":
-        return _baskets(args.max_leg_age, args.limit)
+        return _baskets(args.max_leg_age, args.limit, args.event, args.since_hours)
     if args.command == "probe":
         return _probe(args.interval, args.event)
     if args.command == "falsify":

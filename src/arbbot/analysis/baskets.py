@@ -162,6 +162,19 @@ class BasketEpisode:
     def best_edge(self) -> Decimal:
         return PAYOUT_DOLLARS - self.best_cost
 
+    @property
+    def is_single_observation(self) -> bool:
+        """Seen once, so its duration is bounded by the poll interval and not
+        measured by it.
+
+        A duration of zero from a single observation does not mean the edge was
+        instantaneous. It means the archive saw it once and cannot say whether
+        it lasted a millisecond or almost two polls. Reporting those together
+        with genuinely measured multi-observation episodes is how a sampling
+        artefact gets read as a finding.
+        """
+        return self.observations == 1
+
 
 @dataclass(slots=True)
 class ScanResult:
@@ -183,6 +196,38 @@ class ScanResult:
         the top of the report.
         """
         return max(self.episodes, key=lambda e: e.best_net, default=None)
+
+    def survival_curve(self) -> list[tuple[str, int, int]]:
+        """How long episodes lasted, split by whether they survived their fees.
+
+        This is the question the whole collection run exists to answer, and
+        until the fast-poll probe it could not be asked: at a thirty-second
+        poll every episode reports the same duration of zero, which only means
+        "shorter than one poll" and is equally consistent with a millisecond
+        and with twenty-nine seconds. Those imply opposite conclusions about
+        whether anything here is reachable at retail latency.
+        """
+        buckets: list[tuple[str, float]] = [
+            ("single sample", 0.0),
+            ("<= 2s", 2.0),
+            ("<= 5s", 5.0),
+            ("<= 15s", 15.0),
+            ("<= 60s", 60.0),
+            ("> 60s", float("inf")),
+        ]
+        rows: list[tuple[str, int, int]] = []
+        for index, (label, upper) in enumerate(buckets):
+            lower = buckets[index - 1][1] if index else -1.0
+            if index == 0:
+                matched = [e for e in self.episodes if e.is_single_observation]
+            else:
+                matched = [
+                    e
+                    for e in self.episodes
+                    if not e.is_single_observation and lower < e.duration.total_seconds() <= upper
+                ]
+            rows.append((label, len(matched), sum(1 for e in matched if e.best_net > ZERO)))
+        return rows
 
     def render(self, limit: int = 15) -> str:
         lines = [
@@ -214,6 +259,14 @@ class ScanResult:
                 f"{_duration(ep.duration):>8}  {ep.first_seen:%Y-%m-%d %H:%M:%S}"
             )
 
+        lines.append("")
+        lines.append("how long they lasted:")
+        lines.append(f"  {'duration':<16} {'episodes':>9} {'net-positive':>13}")
+        for label, total, still_positive in self.survival_curve():
+            if total:
+                lines.append(f"  {label:<16} {total:>9,} {still_positive:>13,}")
+        lines.append("  'single sample' means seen once: shorter than two polls, not measured.")
+
         gross_total = sum((e.best_dollars for e in self.episodes), ZERO)
         net_total = sum((e.best_net for e in self.episodes), ZERO)
         positive = sum((e.best_net for e in survivors), ZERO)
@@ -241,9 +294,16 @@ def scan_baskets(
     *,
     max_leg_age: dt.timedelta = DEFAULT_MAX_LEG_AGE,
     since: dt.datetime | None = None,
+    event: str | None = None,
     fees: FeeSchedule = KALSHI_2022_SCHEDULE,
 ) -> ScanResult:
-    """Walk the archive and record every full, fresh set priced below payout."""
+    """Walk the archive and record every full, fresh set priced below payout.
+
+    ``event`` narrows the scan to one event. That is what the fast-poll probe
+    needs: the probe covers a single event at one second while the broad
+    collector covers a hundred and twenty at thirty, and mixing the two would
+    average a measured duration together with an unmeasured one.
+    """
     stmt = select(
         BookSnapshot.ticker,
         BookSnapshot.captured_ts,
@@ -252,6 +312,8 @@ def scan_baskets(
     ).order_by(BookSnapshot.captured_ts, BookSnapshot.id)
     if since is not None:
         stmt = stmt.where(BookSnapshot.captured_ts >= since)
+    if event is not None:
+        stmt = stmt.where(BookSnapshot.ticker.startswith(f"{event}-"))
 
     rows = session.execute(stmt).all()
 

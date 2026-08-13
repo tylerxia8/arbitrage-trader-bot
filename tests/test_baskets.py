@@ -243,6 +243,75 @@ class TestGrouping:
         assert scan_baskets(session).observations == []
 
 
+class TestEventFilter:
+    def test_the_scan_can_be_narrowed_to_one_event(self, session: Session) -> None:
+        """The probe covers one event at one second while the collector covers
+        a hundred and twenty at thirty. Reading them together averages a
+        measured duration together with an unmeasured one."""
+        full_set(session, ["0.30", "0.30", "0.30"])
+        for leg in ("A", "B"):
+            session.add(
+                BookSnapshot(
+                    venue="kalshi",
+                    ticker=f"KXHIGHOTHER-26AUG13-{leg}",
+                    captured_ts=T0,
+                    sequence=1,
+                    yes_levels={},
+                    no_levels={"0.9900": "10"},
+                    checksum="y" * 64,
+                    is_complete=True,
+                )
+            )
+        session.flush()
+
+        result = scan_baskets(session, event=EVENT)
+        assert result.events_seen == 1
+        assert {o.event for o in result.observations} == {EVENT}
+
+    def test_a_prefix_does_not_match_a_longer_event(self, session: Session) -> None:
+        """``KXHIGHNY-26AUG14`` must not sweep in ``KXHIGHNY-26AUG14X``."""
+        full_set(session, ["0.30", "0.30", "0.30"])
+        assert scan_baskets(session, event=EVENT[:-1]).observations == []
+
+
+class TestSurvivalCurve:
+    def test_a_single_sample_is_not_reported_as_zero_duration(self, session: Session) -> None:
+        """The whole reason the probe exists: a duration of zero from one
+        observation means "shorter than one poll", not "instantaneous"."""
+        full_set(session, ["0.30", "0.30", "0.30"])
+        result = scan_baskets(session)
+        episode = result.episodes[0]
+
+        assert episode.is_single_observation
+        assert dict((label, n) for label, n, _ in result.survival_curve())["single sample"] == 1
+        assert dict((label, n) for label, n, _ in result.survival_curve())["<= 2s"] == 0
+
+    def test_a_measured_episode_lands_in_a_duration_bucket(self, session: Session) -> None:
+        full_set(session, ["0.30", "0.30", "0.30"], at=T0)
+        full_set(session, ["0.31", "0.30", "0.30"], at=T0 + dt.timedelta(seconds=4))
+        curve = dict((label, n) for label, n, _ in scan_baskets(session).survival_curve())
+
+        assert curve["single sample"] == 0
+        assert curve["<= 5s"] == 1
+
+    def test_the_curve_separates_the_ones_that_survive_fees(self, session: Session) -> None:
+        """Duration only matters for episodes that were worth taking. A long
+        run of a basket that loses money to fees is not an opportunity."""
+        full_set(session, ["0.30", "0.33", "0.33"], at=T0)
+        full_set(session, ["0.30", "0.33", "0.34"], at=T0 + dt.timedelta(seconds=4))
+        rows = [row for row in scan_baskets(session).survival_curve() if row[1]]
+
+        assert rows
+        for _, total, still_positive in rows:
+            assert still_positive <= total
+
+    def test_the_report_explains_the_single_sample_bucket(self, session: Session) -> None:
+        full_set(session, ["0.30", "0.30", "0.30"])
+        rendered = scan_baskets(session).render()
+        assert "how long they lasted" in rendered
+        assert "not measured" in rendered
+
+
 class TestReporting:
     def test_report_states_that_nothing_is_tradeable(self, session: Session) -> None:
         full_set(session, ["0.30", "0.30", "0.30"])
