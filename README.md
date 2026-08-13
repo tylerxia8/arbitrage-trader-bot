@@ -70,6 +70,8 @@ make up             # start PostgreSQL
 cp .env.example .env
 make migrate        # alembic upgrade head
 arbbot doctor       # what is this deployment allowed to do?
+arbbot collect KXHIGHTATL-26AUG13-T92 --interval 15   # archive public books
+arbbot coverage     # do we have 7 continuous days yet? (exit 1 until we do)
 ```
 
 `arbbot doctor` prints both standing execution gates, the environment, and the
@@ -86,7 +88,7 @@ Milestone 0 the answer is always no, because the live path is not compiled in.
 | [src/arbbot/states.py](src/arbbot/states.py) | Order intent state machine |
 | [src/arbbot/reasons.py](src/arbbot/reasons.py) | Closed rejection-reason catalog |
 | [src/arbbot/marketdata/](src/arbbot/marketdata/) | Order book, sequencing, reconstruction |
-| [src/arbbot/collection/](src/arbbot/collection/) | Raw archive, feed health, deterministic replay |
+| [src/arbbot/collection/](src/arbbot/collection/) | Collector, raw archive, feed health, replay, coverage |
 | [src/arbbot/venues/](src/arbbot/venues/) | Venue adapter boundary |
 | [src/arbbot/db/](src/arbbot/db/) | Models: raw archive, markets, terms, registry, audit |
 | [tools/check_no_float.py](tools/check_no_float.py) | FR-002 static enforcement |

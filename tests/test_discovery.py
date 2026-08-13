@@ -11,7 +11,11 @@ from typing import Any
 
 import pytest
 
-from arbbot.venues.kalshi.discovery import StructuralVerdict, classify_event
+from arbbot.venues.kalshi.discovery import (
+    StructuralVerdict,
+    check_integer_coverage,
+    classify_event,
+)
 
 
 def market(ticker: str, strike_type: str | None = "between") -> dict[str, Any]:
@@ -125,6 +129,78 @@ class TestVerdictPolicy:
     @pytest.mark.parametrize("verdict", list(StructuralVerdict))
     def test_every_verdict_is_documented(self, verdict: StructuralVerdict) -> None:
         assert verdict.__doc__
+
+
+def bucket(strike_type: str, floor: str | None = None, cap: str | None = None) -> dict[str, Any]:
+    return {
+        "ticker": f"{strike_type}-{floor}-{cap}",
+        "strike_type": strike_type,
+        "floor_strike": floor,
+        "cap_strike": cap,
+    }
+
+
+#: The real Atlanta high-temperature set, read off the live API on 2026-08-13.
+#: Rules: "<92", "92-93", "94-95", "96-97", "98-99", ">99".
+ATLANTA = [
+    bucket("less", None, "92"),
+    bucket("between", "92", "93"),
+    bucket("between", "94", "95"),
+    bucket("between", "96", "97"),
+    bucket("between", "98", "99"),
+    bucket("greater", "99", None),
+]
+
+
+class TestIntegerCoverage:
+    def test_the_real_weather_set_tiles_the_integers(self) -> None:
+        """The floor/cap fields look like they overlap -- "91 or below" carries
+        cap=92 while the next bucket has floor=92 -- but the settlement rules
+        say the lower tail is *strictly* below 92. Under that convention the
+        set tiles the integers exactly."""
+        report = check_integer_coverage(ATLANTA)
+        assert report.covered, report.problems
+
+    def test_a_missing_middle_bucket_is_a_gap(self) -> None:
+        without_96_97 = [m for m in ATLANTA if m["floor_strike"] != "96"]
+        report = check_integer_coverage(without_96_97)
+        assert not report.covered
+        assert any("gap" in p for p in report.problems)
+
+    def test_an_overlapping_bucket_is_caught(self) -> None:
+        overlapping = [
+            bucket("less", None, "92"),
+            bucket("between", "92", "94"),
+            bucket("between", "94", "95"),
+            bucket("greater", "95", None),
+        ]
+        report = check_integer_coverage(overlapping)
+        assert not report.covered
+        assert any("overlap" in p for p in report.problems)
+
+    def test_a_detached_lower_tail_is_caught(self) -> None:
+        """If the tail stopped at 91 while the first bucket started at 92, the
+        integer 91 would resolve nothing -- and a basket that omits an outcome
+        pays zero when it occurs."""
+        detached = [bucket("less", None, "91"), *ATLANTA[1:]]
+        report = check_integer_coverage(detached)
+        assert not report.covered
+
+    def test_a_detached_upper_tail_is_caught(self) -> None:
+        detached = [*ATLANTA[:-1], bucket("greater", "101", None)]
+        assert not check_integer_coverage(detached).covered
+
+    def test_missing_tails_are_reported_not_assumed(self) -> None:
+        report = check_integer_coverage(ATLANTA[1:-1])
+        assert not report.covered
+        assert "tail" in report.summary
+
+    def test_a_bucket_without_strikes_is_unverifiable(self) -> None:
+        broken = [ATLANTA[0], bucket("between", None, None), ATLANTA[-1]]
+        assert not check_integer_coverage(broken).covered
+
+    def test_summary_reads_cleanly_when_covered(self) -> None:
+        assert check_integer_coverage(ATLANTA).summary == "tiles the integers"
 
 
 class TestReporting:

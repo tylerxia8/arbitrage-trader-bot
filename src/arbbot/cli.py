@@ -111,11 +111,36 @@ def _collect(tickers: list[str], poll_interval: float) -> int:
     return 0
 
 
+def _coverage() -> int:
+    """Report continuous-collection coverage against the M1 exit gate."""
+    from arbbot.collection.coverage import assess_coverage
+    from arbbot.db.session import session_factory
+
+    try:
+        settings = load_settings()
+    except ValidationError as exc:
+        print("configuration          : INVALID", file=sys.stderr)
+        print(exc, file=sys.stderr)
+        return 2
+
+    engine = create_engine_from_settings(settings)
+    with session_factory(engine)() as session:
+        assessment = assess_coverage(session)
+
+    print(assessment.render())
+    # Non-zero until the gate is met, so this can gate a release check rather
+    # than needing someone to read the table and decide.
+    return 0 if assessment.meets_gate else 1
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="arbbot", description=__doc__)
     parser.add_argument("--version", action="version", version=f"arbbot {__version__}")
     subparsers = parser.add_subparsers(dest="command", required=True)
     subparsers.add_parser("doctor", help="validate configuration and report execution gates")
+    subparsers.add_parser(
+        "coverage", help="report continuous-collection coverage against the M1 exit gate"
+    )
 
     collect = subparsers.add_parser("collect", help="poll public order books and archive them")
     collect.add_argument("tickers", nargs="+", help="market tickers to collect")
@@ -130,6 +155,8 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.command == "doctor":
         return _doctor()
+    if args.command == "coverage":
+        return _coverage()
     if args.command == "collect":
         return _collect(args.tickers, args.interval)
     parser.error(f"unknown command {args.command!r}")  # pragma: no cover -- NoReturn

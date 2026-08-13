@@ -109,17 +109,37 @@ $0.746 basket and being wrong in the most expensive available direction.
 
 ## Open questions for the owner
 
-1. **Boundary semantics — needs a human.** Subtitles tile cleanly
-   (`≤91`, `92-93`, `94-95`, `96-97`, `98-99`, `≥100`), but the raw
-   `floor_strike`/`cap_strike` fields disagree with them: `91° or below`
-   carries `cap=92`, and `100° or above` carries `floor=99`. Whether that is
-   an inclusive/exclusive convention or a real overlap cannot be settled from
-   the numbers. Someone has to read the settlement rules. This is precisely
-   the FR-008 gap-and-overlap check, and precisely why it belongs to a
-   reviewer rather than a parser.
+1. ~~**Boundary semantics.**~~ **Resolved by reading the rules.** The
+   `floor_strike`/`cap_strike` fields looked like they overlapped — `91° or
+   below` carries `cap=92` while the next bucket has `floor=92`. The
+   settlement text says why:
 
-2. **Settlement source.** Which weather station, which reporting agency, what
-   happens to a revised observation. All terms-level questions.
+   | Bucket | Rule text | Covers |
+   |---|---|---|
+   | `91° or below` | "is **less than** 92°" | (−∞, 92) |
+   | `92° to 93°` | "is **between** 92-93°" | [92, 93] |
+   | `100° or above` | "is **greater than** 99°" | (99, +∞) |
+
+   So `less` is strictly-below-cap, `between` is inclusive both ends, and
+   `greater` is strictly-above-floor. Under that convention the set has real
+   holes on the reals — **93.5 resolves nothing** — and tiles perfectly on the
+   integers. Checked across every live temperature partition: **10 of 10 tile
+   cleanly**, so the convention is consistent rather than incidental.
+   Implemented as `check_integer_coverage` (FR-008).
+
+   **The residual assumption is the important part.** Exhaustiveness depends
+   entirely on the settlement source reporting whole degrees. The rules name
+   the NWS Climatological Report (Daily). If that source ever published a
+   fractional reading, a basket holding every leg would pay **zero** on a
+   value that fell in a hole. That belongs in the approval record as a stated
+   dependency, not as an unexamined background fact.
+
+2. **Settlement source — still open, and it has teeth.** The rules say to
+   "use the **latest version** of the data for the desired date, keeping in
+   mind that different cities update their reports at different frequencies."
+   NWS reports are revised. A revision after settlement could move which
+   bucket won. Worth understanding before capital is committed, and worth
+   watching via the terms-hash monitoring in FR-004.
 
 3. **Fees are still unmodelled.** Every number here is gross. The fee service
    is Milestone 2 (EPIC-9), and until it exists no figure in this document
