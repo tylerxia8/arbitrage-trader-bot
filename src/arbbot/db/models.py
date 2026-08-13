@@ -33,7 +33,7 @@ from sqlalchemy import (
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
-from arbbot.db.base import Base, Json, Sha256, Timestamp
+from arbbot.db.base import Base, BigIntPk, Json, Sha256, Timestamp
 from arbbot.relationships import ApprovalDecision, RelationshipStatus, RelationshipType
 
 __all__ = [
@@ -60,10 +60,16 @@ class RawMessage(Base):
 
     __tablename__ = "raw_message"
 
-    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    id: Mapped[BigIntPk]
     venue: Mapped[str] = mapped_column(String(32))
     channel: Mapped[str] = mapped_column(String(128))
     """REST endpoint path or WebSocket channel name."""
+
+    subscription_key: Mapped[str | None] = mapped_column(String(160))
+    """Identity of the stream a sequence number belongs to, e.g.
+    ``orderbook_delta:KXBTC-25DEC31``. Sequence numbers are per-subscription,
+    so without this a message from one market collides with the same sequence
+    number from another."""
 
     sequence: Mapped[int | None] = mapped_column(BigInteger)
     """Venue sequence number where the channel provides one. Gaps are detectable
@@ -83,8 +89,17 @@ class RawMessage(Base):
 
     __table_args__ = (
         Index("ix_raw_message_channel_received", "channel", "received_ts"),
-        Index("ix_raw_message_venue_sequence", "venue", "channel", "sequence"),
-        UniqueConstraint("venue", "channel", "sha256", name="uq_raw_message_dedupe"),
+        Index("ix_raw_message_venue_sequence", "venue", "subscription_key", "sequence"),
+        # Identity is (stream, sequence) -- the venue's own statement of "this
+        # is message N of this subscription" -- not payload content. Two
+        # heartbeats a minute apart are byte-identical and both real; keying
+        # dedupe on content would discard the second as though it never
+        # happened. Rows with a NULL sequence never collide, because NULL is
+        # distinct from NULL in a unique index, so unsequenced messages are
+        # always stored.
+        UniqueConstraint(
+            "venue", "subscription_key", "sequence", name="uq_raw_message_stream_sequence"
+        ),
     )
 
 
@@ -228,6 +243,88 @@ class Approval(Base):
     __table_args__ = (Index("ix_approval_relationship", "relationship_id", "decided_ts"),)
 
 
+class BookSnapshot(Base):
+    """Reconstructed book state at a point in time.
+
+    A derived artifact, not evidence: it can always be rebuilt by replaying
+    the raw archive. It exists so that detection does not have to replay from
+    the beginning of time, and so that a stored ``checksum`` lets replay assert
+    it reproduced exactly the state that was acted on (FR-001).
+
+    ``raw_message_id`` links the snapshot to the exact message that produced
+    it, which is what makes an evaluation traceable to its inputs (FR-003).
+    """
+
+    __tablename__ = "book_snapshot"
+
+    id: Mapped[BigIntPk]
+    venue: Mapped[str] = mapped_column(String(32))
+    ticker: Mapped[str] = mapped_column(String(128))
+    captured_ts: Mapped[Timestamp] = mapped_column(server_default=func.now())
+    sequence: Mapped[int | None] = mapped_column(BigInteger)
+
+    yes_levels: Mapped[Json]
+    no_levels: Mapped[Json]
+    """Resting bids per side as ``{price_cents: quantity}``. Stored as the
+    venue quotes them; executable asks are derived, never persisted, so the
+    record cannot drift from what was actually reported."""
+
+    checksum: Mapped[Sha256]
+    is_complete: Mapped[bool] = mapped_column(Boolean, default=False)
+    """False if a gap or integrity failure left the book unusable. An
+    incomplete snapshot is kept for diagnostics and must never be priced."""
+
+    raw_message_id: Mapped[int | None] = mapped_column(
+        ForeignKey("raw_message.id", ondelete="RESTRICT")
+    )
+    """RESTRICT, not CASCADE: deleting archived evidence that a snapshot
+    depends on must fail loudly rather than quietly orphan the derivation."""
+
+    __table_args__ = (
+        Index("ix_book_snapshot_market_captured", "venue", "ticker", "captured_ts"),
+        Index("ix_book_snapshot_sequence", "venue", "ticker", "sequence"),
+    )
+
+
+class FeedHealth(Base):
+    """Periodic health sample for one subscription stream.
+
+    NFR-01 forbids a silent outage longer than two minutes, which is only
+    enforceable if the absence of data is itself recorded. Sampling on a timer
+    means a stopped collector leaves a visible hole in this table rather than
+    simply writing nothing anywhere.
+    """
+
+    __tablename__ = "feed_health"
+
+    id: Mapped[BigIntPk]
+    observed_ts: Mapped[Timestamp] = mapped_column(server_default=func.now())
+    venue: Mapped[str] = mapped_column(String(32))
+    subscription_key: Mapped[str] = mapped_column(String(160))
+
+    messages: Mapped[int] = mapped_column(BigInteger, default=0)
+    gaps: Mapped[int] = mapped_column(Integer, default=0)
+    missing_messages: Mapped[int] = mapped_column(BigInteger, default=0)
+    """Skipped sequence numbers, not gap events. One gap of 500 and 500 gaps
+    of one are very different conditions and must not aggregate together."""
+
+    duplicates: Mapped[int] = mapped_column(Integer, default=0)
+    rewinds: Mapped[int] = mapped_column(Integer, default=0)
+    reconnects: Mapped[int] = mapped_column(Integer, default=0)
+    parse_errors: Mapped[int] = mapped_column(Integer, default=0)
+
+    last_message_ts: Mapped[dt.datetime | None] = mapped_column()
+    lag_ms: Mapped[int | None] = mapped_column(Integer)
+    """Age of the most recent message at sample time. Measured, never assumed
+    (NFR-10)."""
+
+    is_healthy: Mapped[bool] = mapped_column(Boolean, default=False)
+
+    __table_args__ = (
+        Index("ix_feed_health_stream_observed", "venue", "subscription_key", "observed_ts"),
+    )
+
+
 class AuditEvent(Base):
     """Append-only record of every decision, approval, and configuration change.
 
@@ -237,7 +334,7 @@ class AuditEvent(Base):
 
     __tablename__ = "audit_event"
 
-    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    id: Mapped[BigIntPk]
     occurred_ts: Mapped[Timestamp] = mapped_column(server_default=func.now())
     actor: Mapped[str] = mapped_column(String(128))
     """Human identity, service name, or "system". Attribution is mandatory."""

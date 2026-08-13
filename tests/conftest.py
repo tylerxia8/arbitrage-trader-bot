@@ -9,8 +9,31 @@ test, because it will pass in CI for the wrong reason.
 from __future__ import annotations
 
 import os
+from collections.abc import Iterator
 
 import pytest
+from sqlalchemy import create_engine
+from sqlalchemy.orm import Session
+
+from arbbot.db import models  # noqa: F401  -- registers tables on Base.metadata
+from arbbot.db.base import Base
+
+
+@pytest.fixture
+def session() -> Iterator[Session]:
+    """An isolated in-memory database per test.
+
+    SQLite rather than PostgreSQL: these tests exercise application logic, and
+    binding them to a running container would make the suite unrunnable on a
+    laptop with no Docker. The behaviours that genuinely need PostgreSQL --
+    the append-only triggers, migration reversibility -- are verified against
+    a real server in CI instead.
+    """
+    engine = create_engine("sqlite://")
+    Base.metadata.create_all(engine)
+    with Session(engine) as db_session:
+        yield db_session
+    engine.dispose()
 
 
 @pytest.fixture(autouse=True)

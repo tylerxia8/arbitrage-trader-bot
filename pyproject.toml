@@ -52,6 +52,7 @@ money_path_roots = [
     "src/arbbot/money.py",
     "src/arbbot/config.py",
     "src/arbbot/db/base.py",
+    "src/arbbot/marketdata",  # prices and sizes are integers; keep them that way
     "src/arbbot/fees",        # M2
     "src/arbbot/economics",   # M2
     "src/arbbot/detector",    # M2

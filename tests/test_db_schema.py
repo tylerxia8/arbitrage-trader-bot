@@ -21,6 +21,8 @@ EXPECTED_TABLES = {
     "relationship",
     "approval",
     "audit_event",
+    "book_snapshot",
+    "feed_health",
 }
 
 
@@ -64,9 +66,15 @@ def constraint_names(table_name: str) -> set[str]:
 
 
 class TestEvidenceIntegrity:
-    def test_raw_messages_are_deduplicated_by_content_hash(self) -> None:
-        """Reconnects replay messages; the archive must not double-count them."""
-        assert "uq_raw_message_dedupe" in constraint_names("raw_message")
+    def test_raw_messages_are_deduplicated_by_stream_and_sequence(self) -> None:
+        """Reconnects replay messages; the archive must not double-count them.
+
+        Keyed on the venue's own message numbering rather than on payload
+        content. Content-keyed dedupe -- what M0 shipped -- silently drops two
+        identical heartbeats a minute apart, both of which really happened.
+        """
+        assert "uq_raw_message_stream_sequence" in constraint_names("raw_message")
+        assert "uq_raw_message_dedupe" not in constraint_names("raw_message")
 
     def test_markets_are_unique_per_venue_ticker(self) -> None:
         assert "uq_market_venue_ticker" in constraint_names("market")

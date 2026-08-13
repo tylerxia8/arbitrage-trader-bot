@@ -13,11 +13,11 @@ import datetime as dt
 from decimal import Decimal
 from typing import Annotated, Any
 
-from sqlalchemy import JSON, DateTime, MetaData, Numeric, String
+from sqlalchemy import JSON, BigInteger, DateTime, Integer, MetaData, Numeric, String
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, mapped_column, registry
 
-__all__ = ["Base", "Json", "Money", "Sha256", "Timestamp"]
+__all__ = ["Base", "BigIntPk", "Json", "Money", "Sha256", "Timestamp"]
 
 NAMING_CONVENTION = {
     "ix": "ix_%(column_0_label)s",
@@ -41,6 +41,21 @@ Sha256 = Annotated[str, mapped_column(String(64))]
 
 #: JSONB on PostgreSQL, plain JSON on SQLite fixtures.
 Json = Annotated[dict[str, Any], mapped_column(JSON().with_variant(JSONB, "postgresql"))]
+
+#: Auto-incrementing 64-bit surrogate key for high-volume append-only tables.
+#:
+#: The SQLite variant is load-bearing rather than cosmetic. SQLite only
+#: auto-populates a rowid alias declared exactly ``INTEGER PRIMARY KEY``; a
+#: ``BIGINT`` primary key is an ordinary column there, so every insert in the
+#: local test suite fails on a NOT NULL violation. PostgreSQL, where the
+#: archive actually lives, still gets BIGINT -- a 32-bit key would be a real
+#: ceiling for a table that stores every message the venue ever sent.
+BigIntPk = Annotated[
+    int,
+    mapped_column(
+        BigInteger().with_variant(Integer, "sqlite"), primary_key=True, autoincrement=True
+    ),
+]
 
 
 class Base(DeclarativeBase):

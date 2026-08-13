@@ -8,7 +8,7 @@ human-approved logical relationships, and simulates execution against real
 order-book depth and exact fees. Whether a tradeable edge exists is a question
 this system is built to answer — not an assumption it is built on.
 
-> **Status: pre-M0.** Read-only and shadow-simulation only.
+> **Status: M1 in progress.** Read-only and shadow-simulation only.
 > Live order submission is not implemented and is gated behind a build flag, a
 > runtime flag, and per-basket human approval.
 
@@ -85,6 +85,9 @@ Milestone 0 the answer is always no, because the live path is not compiled in.
 | [src/arbbot/buildflags.py](src/arbbot/buildflags.py) | Compile-time capability flags (not env-readable) |
 | [src/arbbot/states.py](src/arbbot/states.py) | Order intent state machine |
 | [src/arbbot/reasons.py](src/arbbot/reasons.py) | Closed rejection-reason catalog |
+| [src/arbbot/marketdata/](src/arbbot/marketdata/) | Order book, sequencing, reconstruction |
+| [src/arbbot/collection/](src/arbbot/collection/) | Raw archive, feed health, deterministic replay |
+| [src/arbbot/venues/](src/arbbot/venues/) | Venue adapter boundary |
 | [src/arbbot/db/](src/arbbot/db/) | Models: raw archive, markets, terms, registry, audit |
 | [tools/check_no_float.py](tools/check_no_float.py) | FR-002 static enforcement |
 | [docs/adr/](docs/adr/) | Architecture decision records |
