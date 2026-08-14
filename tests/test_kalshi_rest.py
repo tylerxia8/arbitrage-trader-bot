@@ -21,6 +21,7 @@ from arbbot.venues.kalshi.rest import (
     PRODUCTION_REST_BASE,
     KalshiRestClient,
     RateLimiter,
+    VenueUnreachable,
 )
 
 
@@ -174,6 +175,81 @@ class TestRetries:
                 await client.fetch_orderbook("MISSING")
 
         assert attempts == 1
+
+
+class TestCircuitBreaker:
+    """When a venue refuses this address, stop asking.
+
+    On 2026-08-14 the production host answered TCP and then reset every TLS
+    handshake. The collector retried against that for fifteen and a half hours,
+    which produced no data and gave the venue fifteen hours of unwanted
+    traffic. Patience does not convert a refusal into a response; it only
+    lengthens the refusal.
+    """
+
+    async def test_repeated_transport_failures_open_the_circuit(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            raise httpx.ConnectError("connection reset")
+
+        client = client_with(handler, max_attempts=1, failure_threshold=3)
+        for _ in range(3):
+            with pytest.raises(httpx.TransportError):
+                await client.fetch_orderbook("KXTEST-1")
+
+        with pytest.raises(VenueUnreachable, match="circuit open"):
+            await client.fetch_orderbook("KXTEST-1")
+
+    async def test_the_open_circuit_makes_no_request(self) -> None:
+        """The whole point: an open circuit must stop the traffic, not merely
+        relabel the error."""
+        calls = 0
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal calls
+            calls += 1
+            raise httpx.ConnectError("connection reset")
+
+        client = client_with(handler, max_attempts=1, failure_threshold=2)
+        for _ in range(2):
+            with pytest.raises(httpx.TransportError):
+                await client.fetch_orderbook("KXTEST-1")
+        before = calls
+
+        with pytest.raises(VenueUnreachable):
+            await client.fetch_orderbook("KXTEST-1")
+        assert calls == before
+
+    async def test_a_success_resets_the_count(self) -> None:
+        """Two failures an hour apart with a success between them are a flaky
+        network, not a block, and treating them as one would take a working
+        collector offline."""
+        responses = [httpx.ConnectError("reset"), None, httpx.ConnectError("reset")]
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            outcome = responses.pop(0)
+            if outcome is not None:
+                raise outcome
+            return httpx.Response(200, json={"orderbook": {"yes": [], "no": []}})
+
+        client = client_with(handler, max_attempts=1, failure_threshold=2)
+        with pytest.raises(httpx.TransportError):
+            await client.fetch_orderbook("KXTEST-1")
+        await client.fetch_orderbook("KXTEST-1")
+        with pytest.raises(httpx.TransportError):
+            await client.fetch_orderbook("KXTEST-1")
+
+        assert client._tripped is False
+
+    async def test_an_http_error_does_not_open_the_circuit(self) -> None:
+        """A 404 is the venue answering. Only a transport failure is a refusal
+        to talk, and conflating them would trip the breaker on one delisted
+        market."""
+        client = client_with(lambda r: httpx.Response(404), max_attempts=1, failure_threshold=1)
+        for _ in range(3):
+            with pytest.raises(httpx.HTTPStatusError):
+                await client.fetch_orderbook("KXTEST-1")
+
+        assert client._tripped is False
 
 
 class TestPagination:

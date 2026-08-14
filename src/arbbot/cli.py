@@ -9,7 +9,10 @@ is armed when it is not, or -- far worse -- the reverse.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import sys
+from collections.abc import Iterator
+from typing import Any
 
 from pydantic import ValidationError
 from sqlalchemy import text
@@ -19,6 +22,42 @@ from arbbot.config import Settings, load_settings
 from arbbot.db.session import create_engine_from_settings
 
 __all__ = ["main"]
+
+
+@contextlib.contextmanager
+def _venue_budget(engine: Any, consumer: str, requests_per_second: int) -> Iterator[None]:
+    """Hold a share of the venue's request budget for the life of a command.
+
+    Every command that touches the venue goes through here, because the thing
+    that got this address blocked was not any one component's rate -- each was
+    inside the ceiling it knew about -- but the sum, which nothing owned. A
+    lease refusal stops the command rather than shrinking its rate: choosing a
+    smaller number unilaterally is precisely the reasoning that produced the
+    outage.
+    """
+    from arbbot.db.session import session_factory
+    from arbbot.venues.budget import BudgetExceeded, acquire_lease, release_lease
+
+    factory = session_factory(engine)
+    with factory() as session:
+        try:
+            handle = acquire_lease(
+                session,
+                venue="kalshi",
+                consumer=consumer,
+                requests_per_second=requests_per_second,
+            )
+        except BudgetExceeded as exc:
+            print(f"refusing to start: {exc}", file=sys.stderr)
+            raise SystemExit(3) from exc
+        session.commit()
+
+    try:
+        yield
+    finally:
+        with factory() as session:
+            release_lease(session, handle)
+            session.commit()
 
 
 def _print_gates(settings: Settings) -> None:
@@ -106,8 +145,9 @@ def _collect(tickers: list[str], poll_interval: float, use_universe: bool) -> in
     for noisy in ("httpx", "httpcore"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
 
+    engine = create_engine_from_settings(settings)
+
     async def run() -> None:
-        engine = create_engine_from_settings(settings)
         async with KalshiRestClient(base_url=settings.venue_api_base) as client:
             resolver = UniverseResolver(client)
             if use_universe:
@@ -144,7 +184,8 @@ def _collect(tickers: list[str], poll_interval: float, use_universe: bool) -> in
             await service.run_forever()
 
     try:
-        asyncio.run(run())
+        with _venue_budget(engine, "collector", 4):
+            asyncio.run(run())
     except KeyboardInterrupt:
         print("\nstopped")
     return 0
@@ -244,8 +285,9 @@ def _probe(interval: float, event_ticker: str | None) -> int:
     for noisy in ("httpx", "httpcore"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
 
+    engine = create_engine_from_settings(settings)
+
     async def run() -> None:
-        engine = create_engine_from_settings(settings)
         # A rate budget of its own, so the probe cannot throttle the broad
         # collector: both draw on the venue's bucket, and 6 requests a second
         # here leaves the collector's eight intact inside the ~20/s tier.
@@ -281,7 +323,8 @@ def _probe(interval: float, event_ticker: str | None) -> int:
             await service.run_forever()
 
     try:
-        asyncio.run(run())
+        with _venue_budget(engine, "probe", 6):
+            asyncio.run(run())
     except KeyboardInterrupt:
         print("\nstopped")
     return 0
@@ -310,21 +353,37 @@ def _survey(limit: int, events_per_series: int, max_events: int) -> int:
         # A modest budget of its own: the seven-day collector and the probe are
         # both drawing on the same venue bucket, and a survey that throttles
         # them would trade the M1 exit gate for a snapshot.
+        #
+        # And barely any retries. The default ladder is six attempts backing off
+        # to 63 seconds, which is right for the collector -- a dropped poll
+        # leaves a hole in the archive that cannot be filled afterwards. It is
+        # badly wrong here: a sweep touches hundreds of series and some of them
+        # legitimately error, so the first attempt at this survey spent fifty
+        # minutes on forty seconds of work, patiently retrying dead series. A
+        # survey can simply skip one, and the report counts what it skipped.
         async with KalshiRestClient(
-            base_url=settings.venue_api_base, requests_per_second=5
+            base_url=settings.venue_api_base, requests_per_second=5, max_attempts=2
         ) as client:
-            print("sweeping the venue for verified partitions...")
+            # Flushed, because a sweep runs for minutes and Python buffers
+            # stdout when it is not a terminal. The first run of this looked
+            # identical to a hang for its entire duration, which is how a
+            # genuine hang went unnoticed.
+            def progress(message: str) -> None:
+                print(message, flush=True)
+
+            progress("sweeping the venue for verified partitions...")
             report = await survey_venue(
                 client,
                 events_per_series=events_per_series,
                 max_events=max_events,
-                on_progress=print,
+                on_progress=progress,
             )
             print()
             print(report.render(limit=limit))
 
     try:
-        asyncio.run(run())
+        with _venue_budget(create_engine_from_settings(settings), "survey", 5):
+            asyncio.run(run())
     except KeyboardInterrupt:
         print("\nstopped")
     return 0

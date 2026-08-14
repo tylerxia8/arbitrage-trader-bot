@@ -24,6 +24,7 @@ EXPECTED_TABLES = {
     "book_snapshot",
     "feed_health",
     "poll_cycle",
+    "venue_lease",
     "evaluation",
 }
 

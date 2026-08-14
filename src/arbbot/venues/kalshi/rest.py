@@ -31,6 +31,7 @@ __all__ = [
     "PRODUCTION_REST_BASE",
     "KalshiRestClient",
     "RateLimiter",
+    "VenueUnreachable",
 ]
 
 #: Verified against the live API on 2026-08-12.
@@ -46,6 +47,23 @@ DEFAULT_RATE_LIMIT: Final = 8
 _BACKOFF_BASE_SECONDS: Final = 1.0
 _BACKOFF_MAX_SECONDS: Final = 60.0
 _MAX_ATTEMPTS: Final = 6
+
+#: Consecutive transport failures before a client stops trying entirely.
+#:
+#: Deliberately small. A venue that answers TCP and then resets the TLS
+#: handshake is refusing this address, not struggling, and no amount of
+#: patience converts a refusal into a response -- it only lengthens the
+#: refusal. Three in a row is already unambiguous.
+_FAILURE_THRESHOLD: Final = 3
+
+
+class VenueUnreachable(RuntimeError):
+    """The venue is refusing this address, and the client has stopped asking.
+
+    Distinct from an ordinary transport error so a caller can tell "one request
+    failed" from "we appear to be blocked and must stop", which need opposite
+    responses: the first is retried, the second is escalated to a human.
+    """
 
 
 class RateLimiter:
@@ -98,6 +116,7 @@ class KalshiRestClient:
         requests_per_second: int = DEFAULT_RATE_LIMIT,
         timeout_seconds: float = 15.0,
         max_attempts: int = _MAX_ATTEMPTS,
+        failure_threshold: int = _FAILURE_THRESHOLD,
         client: httpx.AsyncClient | None = None,
     ) -> None:
         """
@@ -107,13 +126,23 @@ class KalshiRestClient:
             thirty seconds before surrendering, which is far longer than a
             five-second poll interval and would stall every other market in
             the cycle behind one broken one.
+        :param failure_threshold: consecutive *transport* failures before the
+            circuit opens and this client stops trying. Transport failures are
+            singled out because they are how refusal looks: on 2026-08-14 the
+            venue answered TCP and then reset every TLS handshake, and the
+            collector retried against that for fifteen hours.
         """
         if max_attempts < 1:
             raise ValueError("max_attempts must be at least 1")
+        if failure_threshold < 1:
+            raise ValueError("failure_threshold must be at least 1")
         self.base_url = base_url.rstrip("/")
         self.venue = VENUE
         self.schema_version = SCHEMA_VERSION
         self.max_attempts = max_attempts
+        self.failure_threshold = failure_threshold
+        self._consecutive_transport_failures = 0
+        self._tripped = False
         self._limiter = RateLimiter(requests_per_second)
         self._owns_client = client is None
         self._client = client or httpx.AsyncClient(
@@ -207,16 +236,33 @@ class KalshiRestClient:
         url = f"{self.base_url}{path}"
         delay = _BACKOFF_BASE_SECONDS
 
+        if self._tripped:
+            raise VenueUnreachable(
+                f"circuit open after {self._consecutive_transport_failures} consecutive "
+                f"transport failures at {self.base_url}. Not retrying: when a venue stops "
+                f"completing TLS handshakes it is refusing this address, and continuing to "
+                f"knock is what turns a short refusal into a long one. Diagnose before reopening."
+            )
+
         for attempt in range(1, self.max_attempts + 1):
             await self._limiter.acquire()
             try:
                 response = await self._client.get(url, params=params)
             except httpx.TransportError:
+                # A transport failure is not a slow venue. TCP connected and the
+                # peer reset the handshake, or nothing answered at all -- and on
+                # 2026-08-14 that was the venue blocking this address while the
+                # collector patiently retried for fifteen hours.
+                self._consecutive_transport_failures += 1
+                if self._consecutive_transport_failures >= self.failure_threshold:
+                    self._tripped = True
                 if attempt == self.max_attempts:
                     raise
                 await asyncio.sleep(delay)
                 delay = min(delay * 2, _BACKOFF_MAX_SECONDS)
                 continue
+            else:
+                self._consecutive_transport_failures = 0
 
             # The venue publishes no Retry-After; the bucket refills
             # continuously, so exponential backoff is the documented remedy.

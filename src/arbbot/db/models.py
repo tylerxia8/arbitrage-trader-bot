@@ -341,6 +341,48 @@ class FeedHealth(Base):
     )
 
 
+class VenueLease(Base):
+    """A claim on part of one venue's request budget.
+
+    The venue rate-limits per IP, and this system rate-limits per *component*.
+    Those are not the same denominator, and on 2026-08-14 the difference cost
+    the project its access: a collector at four requests a second, a one-second
+    probe at six, a proposal sweep, and a venue-wide survey at five were each
+    individually well under the ceiling, ran at once, and summed to well over
+    it. The production host began resetting TLS handshakes and fifteen hours of
+    collection were lost.
+
+    So a budget that is enforced per process is not enforced at all. Every
+    consumer records its claimed rate here before its first request, and a
+    consumer whose rate would push the live total past the venue ceiling
+    refuses to start rather than quietly making the sum somebody else's
+    problem. The database is the only thing all of them share -- the collector
+    runs in a container, the probe and the survey run on the host -- so this is
+    where the arithmetic has to live.
+
+    Leases are heartbeated rather than held, because the failure that matters
+    is a consumer dying without releasing. A stale lease expires and its share
+    returns to the pool; a lease that could only be released cleanly would let
+    one crash lock out the venue until someone noticed.
+    """
+
+    __tablename__ = "venue_lease"
+
+    id: Mapped[BigIntPk]
+    venue: Mapped[str] = mapped_column(String(32))
+    consumer: Mapped[str] = mapped_column(String(64))
+    """What is spending the budget: ``collector``, ``probe``, ``survey``."""
+
+    requests_per_second: Mapped[int] = mapped_column(Integer)
+    owner: Mapped[str] = mapped_column(String(128))
+    """Host and process id, so a stale lease can be traced to what left it."""
+
+    started_ts: Mapped[Timestamp] = mapped_column(server_default=func.now())
+    heartbeat_ts: Mapped[Timestamp] = mapped_column(server_default=func.now())
+
+    __table_args__ = (Index("ix_venue_lease_venue_heartbeat", "venue", "heartbeat_ts"),)
+
+
 class PollCycle(Base):
     """One pass of a poller over its markets, and which of them it confirmed.
 

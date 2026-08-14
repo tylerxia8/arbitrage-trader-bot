@@ -219,7 +219,10 @@ async def survey_venue(
             candidates.append((event, markets))
 
     if on_progress:
-        on_progress(f"{len(candidates)} verified partitions to price; fetching books...")
+        on_progress(
+            f"{report.series_seen} series, {report.events_seen} events examined; "
+            f"{len(candidates)} verified partitions to price"
+        )
 
     for index, (event, markets) in enumerate(candidates):
         tickers = [str(m["ticker"]) for m in markets]
@@ -272,7 +275,7 @@ async def survey_venue(
                 leg_spread=spread,
             )
         )
-        if on_progress and (index + 1) % 25 == 0:
+        if on_progress and (index + 1) % 20 == 0:
             on_progress(f"  priced {index + 1}/{len(candidates)}")
 
     return report
