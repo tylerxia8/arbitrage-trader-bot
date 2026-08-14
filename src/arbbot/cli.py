@@ -287,6 +287,49 @@ def _probe(interval: float, event_ticker: str | None) -> int:
     return 0
 
 
+def _survey(limit: int, events_per_series: int, max_events: int) -> int:
+    """Price every structurally-eligible partition the venue currently lists.
+
+    The temperature verdict is negative and narrow. This separates "nowhere on
+    this venue has room" from "temperature specifically has no room", which
+    imply completely different next moves.
+    """
+    import asyncio
+
+    from arbbot.analysis.survey import survey_venue
+    from arbbot.venues.kalshi.rest import KalshiRestClient
+
+    try:
+        settings = load_settings()
+    except ValidationError as exc:
+        print("configuration          : INVALID", file=sys.stderr)
+        print(exc, file=sys.stderr)
+        return 2
+
+    async def run() -> None:
+        # A modest budget of its own: the seven-day collector and the probe are
+        # both drawing on the same venue bucket, and a survey that throttles
+        # them would trade the M1 exit gate for a snapshot.
+        async with KalshiRestClient(
+            base_url=settings.venue_api_base, requests_per_second=5
+        ) as client:
+            print("sweeping the venue for verified partitions...")
+            report = await survey_venue(
+                client,
+                events_per_series=events_per_series,
+                max_events=max_events,
+                on_progress=print,
+            )
+            print()
+            print(report.render(limit=limit))
+
+    try:
+        asyncio.run(run())
+    except KeyboardInterrupt:
+        print("\nstopped")
+    return 0
+
+
 def _maker(since_hours: float | None, event: str | None, max_age: float, horizon: float) -> int:
     """Replay the archive as a market maker rather than a taker.
 
@@ -567,6 +610,17 @@ def main(argv: list[str] | None = None) -> int:
         help="only scan the last N hours",
     )
 
+    survey = subparsers.add_parser(
+        "survey", help="price every verified partition on the venue, once, to see where room is"
+    )
+    survey.add_argument("--limit", type=int, default=20, help="rows to show")
+    survey.add_argument(
+        "--events-per-series", type=int, default=2, help="events to take from each series"
+    )
+    survey.add_argument(
+        "--max-events", type=int, default=400, help="cap on partitions priced in one sweep"
+    )
+
     maker = subparsers.add_parser(
         "maker", help="replay the archive as a market maker: what would quoting have cost?"
     )
@@ -679,6 +733,8 @@ def main(argv: list[str] | None = None) -> int:
         return _serve(args.host, args.port)
     if args.command == "baskets":
         return _baskets(args.max_leg_age, args.limit, args.event, args.since_hours)
+    if args.command == "survey":
+        return _survey(args.limit, args.events_per_series, args.max_events)
     if args.command == "maker":
         return _maker(args.since_hours, args.event, args.max_leg_age, args.horizon)
     if args.command == "relationships":
