@@ -287,6 +287,157 @@ def _probe(interval: float, event_ticker: str | None) -> int:
     return 0
 
 
+def _relationships(action: str, args: argparse.Namespace) -> int:
+    """Draft, list, and approve logical relationships.
+
+    The approval step is deliberately awkward: it requires a named reviewer and
+    a written record of what they read, and it will refuse without both. That
+    is the point. Every arbitrage this system can detect is downstream of a
+    claim that some set of contracts is mutually exclusive and collectively
+    exhaustive, and nothing but a person reading the settlement terms
+    establishes that.
+    """
+    import asyncio
+
+    from arbbot.db.session import session_factory
+    from arbbot.registry import (
+        RelationshipRegistry,
+        approve_group,
+        fingerprint_of,
+        group_pending,
+        propose_from_events,
+        slug_for,
+    )
+    from arbbot.venues.kalshi.rest import KalshiRestClient
+    from arbbot.venues.kalshi.universe import TEMPERATURE_PREFIXES
+
+    try:
+        settings = load_settings()
+    except ValidationError as exc:
+        print("configuration          : INVALID", file=sys.stderr)
+        print(exc, file=sys.stderr)
+        return 2
+
+    engine = create_engine_from_settings(settings)
+    factory = session_factory(engine)
+
+    if action == "propose":
+
+        async def fetch() -> list[tuple[dict[str, object], list[dict[str, object]]]]:
+            async with KalshiRestClient(
+                base_url=settings.venue_api_base, requests_per_second=6
+            ) as client:
+                series = (
+                    await client.fetch("/series", {"category": "Climate and Weather"})
+                ).payload
+                pairs: list[tuple[dict[str, object], list[dict[str, object]]]] = []
+                for entry in series.get("series", []):
+                    ticker = entry.get("ticker")
+                    if not isinstance(ticker, str) or not ticker.startswith(TEMPERATURE_PREFIXES):
+                        continue
+                    body = (
+                        await client.fetch(
+                            "/events",
+                            {
+                                "series_ticker": ticker,
+                                "limit": 4,
+                                "with_nested_markets": "true",
+                                "status": "open",
+                            },
+                        )
+                    ).payload
+                    for event in body.get("events") or []:
+                        markets = [
+                            m for m in event.get("markets") or [] if m.get("status") == "active"
+                        ]
+                        if markets:
+                            pairs.append((event, markets))
+                return pairs
+
+        print("resolving live events from the venue...")
+        events = asyncio.run(fetch())
+        with factory() as session:
+            report = propose_from_events(session, events)
+            session.commit()
+        print(report.render())
+        return 0
+
+    if action == "list":
+        with factory() as session:
+            groups = group_pending(session)
+            waiting = sum(len(records) for records in groups.values())
+            if not waiting:
+                print("nothing is waiting on a reviewer.")
+                return 0
+
+            print(f"{waiting} relationship(s) awaiting review, in {len(groups)} distinct claim(s).")
+            print("Grouped by the settlement wording a reviewer would actually read: events")
+            print("in one group are the same claim asked about different days.\n")
+
+            for fingerprint, records in sorted(groups.items(), key=lambda kv: -len(kv[1])):
+                example = records[0]
+                proof = dict(example.payout_proof)
+                print(f"=== {len(records)} event(s), fingerprint {fingerprint[:12] or 'none'}")
+                print(f"    representative : {example.slug} (version {example.version})")
+                print(f"    claim          : {proof.get('claim', '')}")
+                print(f"    coverage       : {proof.get('integer_coverage', '')}")
+                for item in proof.get("reviewer_must_confirm", []):
+                    print(f"    confirm        : {item}")
+                rules = {str(b.get("rules_primary") or "") for b in proof.get("boundaries", [])}
+                for text_ in sorted(r for r in rules if r):
+                    print(f"    rules          : {text_[:300]}")
+                print("    events         : " + ", ".join(sorted(r.slug for r in records[:6])))
+                if len(records) > 6:
+                    print(f"                     ...and {len(records) - 6} more")
+                print()
+
+            print("Approve one event:")
+            print("  arbbot relationships approve <slug> --reviewer NAME --evidence TEXT")
+            print("Approve everything one reading covers (each still gets its own record):")
+            print("  arbbot relationships approve <slug> --group --reviewer NAME --evidence TEXT")
+        return 0
+
+    if action == "approve":
+        slug = args.slug if args.slug.startswith("kalshi:") else slug_for(args.slug)
+        with factory() as session:
+            registry = RelationshipRegistry(session)
+            found = registry.latest(slug)
+            if found is None:
+                print(f"no relationship with slug {slug!r}", file=sys.stderr)
+                return 1
+            record = found
+
+            try:
+                if args.group:
+                    approved = approve_group(
+                        session,
+                        fingerprint_of(record),
+                        reviewer=args.reviewer,
+                        evidence=args.evidence,
+                    )
+                else:
+                    registry.approve(record, reviewer=args.reviewer, evidence=args.evidence)
+                    approved = [record]
+            except Exception as exc:
+                print(f"refused: {exc}", file=sys.stderr)
+                return 1
+
+            session.commit()
+            print(f"approved {len(approved)} relationship(s), reviewer: {args.reviewer}")
+            for item in approved[:10]:
+                print(f"  {item.slug} v{item.version}, {len(item.dependency_hashes)} legs")
+            if len(approved) > 10:
+                print(f"  ...and {len(approved) - 10} more")
+            print("")
+            print("Each approval is bound to its own legs' settlement terms as they are")
+            print("right now. If any leg's terms change, that relationship -- and only")
+            print("that one -- suspends on the next proposal pass.")
+        return 0
+
+    print(f"unknown action {action!r}", file=sys.stderr)
+    return 2
+
+
 def _falsify(quantity: str, research: bool) -> int:
     """Replay the archive through the detector and report where candidates die."""
     from decimal import Decimal
@@ -367,6 +518,39 @@ def main(argv: list[str] | None = None) -> int:
         help="only scan the last N hours",
     )
 
+    relationships = subparsers.add_parser(
+        "relationships",
+        help="draft, list, and approve the logical claims every arbitrage rests on",
+    )
+    relationship_actions = relationships.add_subparsers(dest="action", required=True)
+    relationship_actions.add_parser(
+        "propose", help="draft PENDING relationships from the venue's live event structure"
+    )
+    relationship_actions.add_parser("list", help="show everything awaiting a reviewer")
+    approve = relationship_actions.add_parser(
+        "approve", help="record a human's approval of one relationship"
+    )
+    approve.add_argument("slug", help="relationship slug, or the bare event ticker")
+    approve.add_argument(
+        "--group",
+        action="store_true",
+        help="also approve every other pending relationship this same reading covers -- "
+        "the same settlement wording and bucket shape asked about a different day. Each "
+        "still gets its own approval record, bound to its own legs' terms.",
+    )
+    approve.add_argument(
+        "--reviewer",
+        required=True,
+        help="an authenticated human identity. Never a model, never a service account -- "
+        "the point of this record is that a person is answerable for the claim.",
+    )
+    approve.add_argument(
+        "--evidence",
+        required=True,
+        help="what was read: the settlement wording, the source URL, the quoted rule. "
+        "An approval that cannot say what was confirmed is a rubber stamp with a name on it.",
+    )
+
     probe = subparsers.add_parser(
         "probe",
         help="poll one event's legs at high frequency to measure how long edges last",
@@ -420,6 +604,8 @@ def main(argv: list[str] | None = None) -> int:
         return _serve(args.host, args.port)
     if args.command == "baskets":
         return _baskets(args.max_leg_age, args.limit, args.event, args.since_hours)
+    if args.command == "relationships":
+        return _relationships(args.action, args)
     if args.command == "probe":
         return _probe(args.interval, args.event)
     if args.command == "falsify":

@@ -33,7 +33,16 @@ from sqlalchemy import (
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
-from arbbot.db.base import Base, BigIntPk, Json, JsonList, Money, Sha256, Timestamp
+from arbbot.db.base import (
+    Base,
+    BigIntPk,
+    Json,
+    JsonList,
+    JsonRows,
+    Money,
+    Sha256,
+    Timestamp,
+)
 from arbbot.relationships import ApprovalDecision, RelationshipStatus, RelationshipType
 
 __all__ = [
@@ -188,8 +197,13 @@ class RelationshipRecord(Base):
         default=RelationshipStatus.PENDING,
     )
 
-    legs: Mapped[Json]
-    """Leg definitions: venue, ticker, side, and quantity ratio per leg."""
+    legs: Mapped[JsonRows]
+    """Leg definitions: venue, ticker, side, and quantity ratio per leg.
+
+    An array of objects, not a mapping -- typed as such so the checker knows
+    it. Annotating a list column as a dict makes every membership and index
+    check against it silently meaningless.
+    """
 
     payout_proof: Mapped[Json]
     """Truth table or formal implication proof establishing the minimum payout
