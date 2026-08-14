@@ -54,6 +54,24 @@ MAX_LEG_SPREAD: Final = dt.timedelta(seconds=10)
 
 
 @dataclass(frozen=True, slots=True)
+class StructureFinding:
+    """One event that is shaped like a basket, whatever it currently costs.
+
+    Recorded separately from pricing because the two questions have different
+    evidence requirements. Whether six buckets tile the integers is a fact
+    about the market's definition, and the demo host publishes the same
+    definitions as production -- so structure can be answered while production
+    is unreachable. What the basket costs cannot: demo liquidity is not real,
+    and pricing against it would produce a number that looks like a finding.
+    """
+
+    event_ticker: str
+    series: str
+    title: str
+    legs: int
+
+
+@dataclass(frozen=True, slots=True)
 class EventPricing:
     """One partition, priced once."""
 
@@ -90,6 +108,10 @@ class SurveyReport:
     """What one pass over the venue found."""
 
     priced: list[EventPricing] = field(default_factory=list)
+    structures: list[StructureFinding] = field(default_factory=list)
+    """Every verified partition found, priced or not."""
+
+    priced_books: bool = True
     series_seen: int = 0
     events_seen: int = 0
     skipped_structure: int = 0
@@ -117,6 +139,32 @@ class SurveyReport:
             f"  book missing on a leg  : {self.skipped_incomplete}",
             f"  series that errored    : {len(self.series_errors)}",
         ]
+
+        if self.structures:
+            by_series: dict[str, list[StructureFinding]] = {}
+            for finding in self.structures:
+                by_series.setdefault(finding.series or "(unknown)", []).append(finding)
+
+            lines.append("")
+            lines.append(f"verified partitions found : {len(self.structures)}")
+            lines.append(f"across distinct series    : {len(by_series)}")
+            lines.append("")
+            lines.append(f"  {'series':<34} {'events':>7} {'legs':>6}  example")
+            lines.append("  " + "-" * 84)
+            for series, found in sorted(by_series.items(), key=lambda kv: (-len(kv[1]), kv[0])):
+                legs = sorted({f.legs for f in found})
+                shape = str(legs[0]) if len(legs) == 1 else f"{legs[0]}-{legs[-1]}"
+                lines.append(f"  {series:<34} {len(found):>7} {shape:>6}  {found[0].event_ticker}")
+
+        if not self.priced_books:
+            lines.append("")
+            lines.append("STRUCTURE ONLY: no books were fetched and nothing here is priced.")
+            lines.append("Whether these buckets tile the integers is a fact about the market's")
+            lines.append("definition and is answered above. Whether any of them trades below a")
+            lines.append("dollar is not, and cannot be answered from a venue whose liquidity is")
+            lines.append("not real. That half waits for production.")
+            return "\n".join(lines)
+
         if not self.priced:
             lines.append("")
             lines.append("Nothing on this venue priced as a complete, verified partition.")
@@ -162,10 +210,19 @@ async def survey_venue(
     events_per_series: int = 2,
     max_events: int = 400,
     max_leg_spread: dt.timedelta = MAX_LEG_SPREAD,
+    price_books: bool = True,
     on_progress: Any = None,
 ) -> SurveyReport:
-    """Price every structurally-eligible partition the venue currently lists."""
-    report = SurveyReport()
+    """Find, and optionally price, every verified partition the venue lists.
+
+    ``price_books=False`` answers only the structural half: which market
+    families are shaped like baskets. That half is answerable from any host
+    publishing the same market definitions -- including the demo host while
+    production is unreachable -- because whether buckets tile the integers is a
+    property of the definition. Pricing is not, and is skipped rather than
+    computed from liquidity that is not real.
+    """
+    report = SurveyReport(priced_books=price_books)
 
     series_bodies: list[dict[str, Any]] = []
     for category in categories or [None]:  # type: ignore[list-item]
@@ -217,6 +274,19 @@ async def survey_venue(
                 report.skipped_coverage += 1
                 continue
             candidates.append((event, markets))
+            report.structures.append(
+                StructureFinding(
+                    event_ticker=str(event.get("event_ticker", "")),
+                    series=str(event.get("series_ticker") or ticker),
+                    title=str(event.get("title", "")),
+                    legs=len(markets),
+                )
+            )
+
+    if not price_books:
+        if on_progress:
+            on_progress(f"{len(candidates)} verified partitions found; not pricing")
+        return report
 
     if on_progress:
         on_progress(

@@ -330,7 +330,14 @@ def _probe(interval: float, event_ticker: str | None) -> int:
     return 0
 
 
-def _survey(limit: int, events_per_series: int, max_events: int) -> int:
+def _survey(
+    limit: int,
+    events_per_series: int,
+    max_events: int,
+    *,
+    demo: bool = False,
+    structure_only: bool = False,
+) -> int:
     """Price every structurally-eligible partition the venue currently lists.
 
     The temperature verdict is negative and narrow. This separates "nowhere on
@@ -340,7 +347,7 @@ def _survey(limit: int, events_per_series: int, max_events: int) -> int:
     import asyncio
 
     from arbbot.analysis.survey import survey_venue
-    from arbbot.venues.kalshi.rest import KalshiRestClient
+    from arbbot.venues.kalshi.rest import DEMO_REST_BASE, KalshiRestClient
 
     try:
         settings = load_settings()
@@ -348,6 +355,12 @@ def _survey(limit: int, events_per_series: int, max_events: int) -> int:
         print("configuration          : INVALID", file=sys.stderr)
         print(exc, file=sys.stderr)
         return 2
+
+    # Demo leases under its own venue name. It is a different address at the
+    # other end, and making a demo sweep queue behind a production collector's
+    # budget would be arithmetic about the wrong thing.
+    base_url = DEMO_REST_BASE if demo else settings.venue_api_base
+    lease_name = "survey-demo" if demo else "survey"
 
     async def run() -> None:
         # A modest budget of its own: the seven-day collector and the probe are
@@ -362,7 +375,7 @@ def _survey(limit: int, events_per_series: int, max_events: int) -> int:
         # minutes on forty seconds of work, patiently retrying dead series. A
         # survey can simply skip one, and the report counts what it skipped.
         async with KalshiRestClient(
-            base_url=settings.venue_api_base, requests_per_second=5, max_attempts=2
+            base_url=base_url, requests_per_second=5, max_attempts=2
         ) as client:
             # Flushed, because a sweep runs for minutes and Python buffers
             # stdout when it is not a terminal. The first run of this looked
@@ -371,18 +384,19 @@ def _survey(limit: int, events_per_series: int, max_events: int) -> int:
             def progress(message: str) -> None:
                 print(message, flush=True)
 
-            progress("sweeping the venue for verified partitions...")
+            progress(f"sweeping {base_url} for verified partitions...")
             report = await survey_venue(
                 client,
                 events_per_series=events_per_series,
                 max_events=max_events,
+                price_books=not structure_only,
                 on_progress=progress,
             )
             print()
             print(report.render(limit=limit))
 
     try:
-        with _venue_budget(create_engine_from_settings(settings), "survey", 5):
+        with _venue_budget(create_engine_from_settings(settings), lease_name, 5):
             asyncio.run(run())
     except KeyboardInterrupt:
         print("\nstopped")
@@ -679,6 +693,20 @@ def main(argv: list[str] | None = None) -> int:
     survey.add_argument(
         "--max-events", type=int, default=400, help="cap on partitions priced in one sweep"
     )
+    survey.add_argument(
+        "--demo",
+        action="store_true",
+        help="sweep the demo host instead of production. Its market definitions mirror "
+        "production, so structural answers hold; its liquidity does not, so pricing there "
+        "would be a number that looks like a finding and is not.",
+    )
+    survey.add_argument(
+        "--structure-only",
+        action="store_true",
+        help="find verified partitions without fetching any books. Answers where the "
+        "baskets are, which is a fact about market definitions, and leaves what they cost "
+        "to a host with real liquidity.",
+    )
 
     maker = subparsers.add_parser(
         "maker", help="replay the archive as a market maker: what would quoting have cost?"
@@ -793,7 +821,13 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "baskets":
         return _baskets(args.max_leg_age, args.limit, args.event, args.since_hours)
     if args.command == "survey":
-        return _survey(args.limit, args.events_per_series, args.max_events)
+        return _survey(
+            args.limit,
+            args.events_per_series,
+            args.max_events,
+            demo=args.demo,
+            structure_only=args.structure_only,
+        )
     if args.command == "maker":
         return _maker(args.since_hours, args.event, args.max_leg_age, args.horizon)
     if args.command == "relationships":
