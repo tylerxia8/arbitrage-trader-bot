@@ -22,7 +22,7 @@ from typing import Final
 from arbbot.db.models import FeedHealth
 from arbbot.marketdata.sequence import SequenceTracker
 
-__all__ = ["DEFAULT_MAX_SILENCE", "Clock", "StreamHealth", "utc_now"]
+__all__ = ["DEFAULT_MAX_SILENCE", "Clock", "StreamHealth", "as_utc", "utc_now"]
 
 Clock = Callable[[], dt.datetime]
 
@@ -33,6 +33,22 @@ DEFAULT_MAX_SILENCE: Final = dt.timedelta(minutes=2)
 def utc_now() -> dt.datetime:
     """Current time, always timezone-aware."""
     return dt.datetime.now(dt.UTC)
+
+
+def as_utc(when: dt.datetime) -> dt.datetime:
+    """Attach UTC to a timestamp read back from the database, if it lacks one.
+
+    PostgreSQL returns ``timestamptz`` columns as aware datetimes; SQLite,
+    which the test fixtures use, returns them naive. Arithmetic that mixes the
+    two raises, so code doing date maths on stored timestamps breaks on one
+    backend and not the other -- which is the worst way to find out, since the
+    fixtures are the backend that stays quiet.
+
+    Naive values are treated as UTC rather than local: every timestamp this
+    system writes is UTC by construction, so the tzinfo is the only thing that
+    was lost.
+    """
+    return when if when.tzinfo is not None else when.replace(tzinfo=dt.UTC)
 
 
 @dataclass(slots=True)

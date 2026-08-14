@@ -15,17 +15,22 @@ from arbbot.execution.gateway import (
     OrderResult,
     PaperGateway,
 )
+from arbbot.execution.loop import Candidate, LoopReport, TradingLoop
 from arbbot.execution.reconcile import (
     PositionSource,
     Reconciler,
     ReconciliationReport,
     Verdict,
 )
+from arbbot.execution.store import ExecutionStore
 
 __all__ = [
     "BasketIntent",
+    "Candidate",
     "ExecutionResult",
+    "ExecutionStore",
     "Executor",
+    "LoopReport",
     "OrderGateway",
     "OrderOutcome",
     "OrderRequest",
@@ -34,6 +39,7 @@ __all__ = [
     "PositionSource",
     "Reconciler",
     "ReconciliationReport",
+    "TradingLoop",
     "Verdict",
     "leg_key",
 ]

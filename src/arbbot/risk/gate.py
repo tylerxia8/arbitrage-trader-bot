@@ -62,6 +62,16 @@ class OpenIntent:
     """The part of the basket that is acquired but not yet hedged. This is the
     directional exposure a multi-leg strategy actually carries."""
 
+    reserved: bool = False
+    """Committed capacity that is not yet capital at risk.
+
+    A basket parked waiting for a person holds nothing -- no order has been
+    sent. But the loop must not queue sixty of them that each fit individually
+    and cannot all be taken, so they occupy the caps while they wait. Marked
+    explicitly rather than inferred from state, because the state genuinely is
+    not exposed and pretending otherwise would corrupt every other reader.
+    """
+
 
 @dataclass(frozen=True, slots=True)
 class ExposureSnapshot:
@@ -74,7 +84,8 @@ class ExposureSnapshot:
 
     @property
     def open_intents(self) -> list[OpenIntent]:
-        return [i for i in self.intents if is_exposed(i.state)]
+        """Everything occupying capacity: at risk, or reserved while waiting."""
+        return [i for i in self.intents if is_exposed(i.state) or i.reserved]
 
     @property
     def total_committed(self) -> Decimal:

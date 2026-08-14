@@ -162,34 +162,60 @@ class ExecutionStore:
         )
 
     # -- reading ---------------------------------------------------------
-    def exposure(self, *, realised_loss_today: Decimal = ZERO) -> ExposureSnapshot:
+    def exposure(
+        self, *, realised_loss_today: Decimal = ZERO, include_pending: bool = False
+    ) -> ExposureSnapshot:
         """What is currently at risk, computed from the rows.
 
         Derived rather than accumulated. A running total that drifts from the
         rows is worse than no total, because it is confidently wrong -- and the
         risk gate would then size the next basket against a number nothing
         supports.
+
+        :param include_pending: also count baskets parked in ``AWAITING_HUMAN``.
+            They hold nothing -- no order has been sent -- so the executor must
+            *not* count them when deciding whether a submission fits. But the
+            loop must, when deciding whether to park another one: a queue of
+            sixty baskets that each fit individually and cannot all be taken is
+            a queue that lies to whoever is reading it. The executor's own
+            re-check is what keeps that safe; this is what keeps it honest.
         """
         rows = list(self._session.execute(select(OrderIntent)).scalars())
         intents: list[OpenIntent] = []
         for row in rows:
             state = OrderState(row.state)
-            if not is_exposed(state):
+            pending = include_pending and state is OrderState.AWAITING_HUMAN
+            if not is_exposed(state) and not pending:
                 continue
             # Unmatched is the whole notional until the basket is complete.
             # Between the first leg and the last there is no hedge at all, and
             # sizing this against the residual would understate precisely the
             # window that carries the risk.
-            unmatched = ZERO if state is OrderState.FILLED else Decimal(row.notional)
+            # A parked basket reserves capacity but is not unmatched: nothing
+            # has been bought, so there is no directional position to carry.
+            unmatched = (
+                ZERO
+                if state in (OrderState.FILLED, OrderState.AWAITING_HUMAN)
+                else Decimal(row.notional)
+            )
             intents.append(
                 OpenIntent(
                     intent_id=row.intent_id,
                     state=state,
                     committed=Decimal(row.notional),
                     unmatched=unmatched,
+                    reserved=pending,
                 )
             )
         return ExposureSnapshot(intents=intents, realised_loss_today=realised_loss_today)
+
+    def awaiting_human(self) -> list[OrderIntent]:
+        """Intents parked waiting for a person to approve or decline them."""
+        return list(
+            self._session.execute(
+                select(OrderIntent).where(OrderIntent.state == OrderState.AWAITING_HUMAN.value)
+            ).scalars()
+        )
 
     def realised_loss_since(self, since: dt.datetime) -> Decimal:
         """Money lost on intents that ended since ``since``, as a positive number.
