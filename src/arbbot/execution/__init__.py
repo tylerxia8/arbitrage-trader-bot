@@ -15,6 +15,12 @@ from arbbot.execution.gateway import (
     OrderResult,
     PaperGateway,
 )
+from arbbot.execution.reconcile import (
+    PositionSource,
+    Reconciler,
+    ReconciliationReport,
+    Verdict,
+)
 
 __all__ = [
     "BasketIntent",
@@ -25,5 +31,9 @@ __all__ = [
     "OrderRequest",
     "OrderResult",
     "PaperGateway",
+    "PositionSource",
+    "Reconciler",
+    "ReconciliationReport",
+    "Verdict",
     "leg_key",
 ]
