@@ -287,6 +287,45 @@ def _probe(interval: float, event_ticker: str | None) -> int:
     return 0
 
 
+def _maker(since_hours: float | None, event: str | None, max_age: float, horizon: float) -> int:
+    """Replay the archive as a market maker rather than a taker.
+
+    The taker verdict was negative on economics, not on latency, and the venue
+    charges no maker fee on its standard series -- so the whole cost model this
+    system has been fighting is the price of immediacy. This asks what quoting
+    would have cost instead, and whether the quotes would have filled.
+    """
+    import datetime as dt
+
+    from arbbot.analysis.maker import scan_maker_capacity
+    from arbbot.db.session import session_factory
+
+    try:
+        settings = load_settings()
+    except ValidationError as exc:
+        print("configuration          : INVALID", file=sys.stderr)
+        print(exc, file=sys.stderr)
+        return 2
+
+    engine = create_engine_from_settings(settings)
+    with session_factory(engine)() as session:
+        since = (
+            dt.datetime.now(dt.UTC) - dt.timedelta(hours=since_hours)
+            if since_hours is not None
+            else None
+        )
+        report = scan_maker_capacity(
+            session,
+            since=since,
+            event=event,
+            max_leg_age=dt.timedelta(seconds=max_age),
+            horizon=dt.timedelta(seconds=horizon),
+        )
+
+    print(report.render())
+    return 0
+
+
 def _relationships(action: str, args: argparse.Namespace) -> int:
     """Draft, list, and approve logical relationships.
 
@@ -528,6 +567,23 @@ def main(argv: list[str] | None = None) -> int:
         help="only scan the last N hours",
     )
 
+    maker = subparsers.add_parser(
+        "maker", help="replay the archive as a market maker: what would quoting have cost?"
+    )
+    maker.add_argument("--since-hours", type=float, default=None, metavar="HOURS")
+    maker.add_argument("--event", default=None, help="restrict to one event ticker")
+    maker.add_argument(
+        "--max-leg-age", type=float, default=2.0, metavar="SECONDS", help="freshness gate"
+    )
+    maker.add_argument(
+        "--horizon",
+        type=float,
+        default=120.0,
+        metavar="SECONDS",
+        help="how long a resting order is given to fill (default: 120). A basket assembled "
+        "over more than a couple of minutes is six directional bets, not an arbitrage.",
+    )
+
     relationships = subparsers.add_parser(
         "relationships",
         help="draft, list, and approve the logical claims every arbitrage rests on",
@@ -623,6 +679,8 @@ def main(argv: list[str] | None = None) -> int:
         return _serve(args.host, args.port)
     if args.command == "baskets":
         return _baskets(args.max_leg_age, args.limit, args.event, args.since_hours)
+    if args.command == "maker":
+        return _maker(args.since_hours, args.event, args.max_leg_age, args.horizon)
     if args.command == "relationships":
         return _relationships(args.action, args)
     if args.command == "probe":
