@@ -21,6 +21,10 @@ dependencies = [
     "uvicorn[standard]>=0.30,<1",
     "httpx>=0.27,<1",
     "structlog>=24.1,<25",
+    # Request signing for credentialed venue access. Present but inert: the
+    # research environment refuses credentials outright, and the signer refuses
+    # to sign until a human has confirmed the scheme against the venue's docs.
+    "cryptography>=42.0,<46",
 ]
 
 [project.optional-dependencies]
