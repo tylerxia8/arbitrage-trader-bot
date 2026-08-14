@@ -44,6 +44,7 @@ import datetime as dt
 import hashlib
 from dataclasses import dataclass, field
 from decimal import Decimal
+from typing import Protocol
 
 from arbbot import buildflags
 from arbbot.execution.gateway import OrderGateway, OrderOutcome, OrderRequest, OrderResult
@@ -52,7 +53,7 @@ from arbbot.reasons import RejectionReason
 from arbbot.risk import ExposureSnapshot, RiskGate
 from arbbot.states import OrderState, assert_transition
 
-__all__ = ["BasketIntent", "ExecutionResult", "Executor", "leg_key"]
+__all__ = ["BasketIntent", "ExecutionJournal", "ExecutionResult", "Executor", "leg_key"]
 
 
 def leg_key(intent_id: str, ticker: str) -> str:
@@ -113,12 +114,45 @@ class ExecutionResult:
         return self.state in (OrderState.UNKNOWN, OrderState.INCIDENT)
 
 
+class ExecutionJournal(Protocol):
+    """Where an executor records what it is about to do, before doing it.
+
+    A protocol so the executor can be tested without a database, and so the
+    ordering requirement is visible in the type rather than buried in a
+    persistence layer: ``opened`` is called before the first order is sent,
+    ``leg`` as each one resolves, ``ended`` last. A journal called only at the
+    end would be missing for exactly the runs that crashed mid-acquisition,
+    which are the ones with real positions left at the venue.
+    """
+
+    def opened(self, intent: BasketIntent) -> None: ...
+
+    def leg(
+        self, intent_id: str, request: OrderRequest, result: OrderResult, side: str
+    ) -> None: ...
+
+    def ended(self, result: ExecutionResult) -> None: ...
+
+
 class Executor:
     """Acquires approved baskets, or gets out of them."""
 
-    def __init__(self, gateway: OrderGateway, risk: RiskGate) -> None:
+    def __init__(
+        self,
+        gateway: OrderGateway,
+        risk: RiskGate,
+        *,
+        journal: ExecutionJournal | None = None,
+    ) -> None:
         self._gateway = gateway
         self._risk = risk
+        self._journal = journal
+
+    def _record_leg(
+        self, intent_id: str, request: OrderRequest, result: OrderResult, side: str
+    ) -> None:
+        if self._journal is not None:
+            self._journal.leg(intent_id, request, result, side)
 
     def _refuse(
         self, intent: BasketIntent, reason: RejectionReason, detail: str
@@ -139,6 +173,21 @@ class Executor:
         self, intent: BasketIntent, *, exposure: ExposureSnapshot | None = None
     ) -> ExecutionResult:
         """Take a basket, or refuse, or fail safely.
+
+        A thin wrapper so ``ended`` is journalled exactly once, on every path
+        out. Scattering that call across each return is how one branch ends up
+        missing it, and the branch that gets missed is always an unusual one --
+        which is exactly the intent whose record someone will later need.
+        """
+        result = await self._acquire(intent, exposure=exposure)
+        if self._journal is not None:
+            self._journal.ended(result)
+        return result
+
+    async def _acquire(
+        self, intent: BasketIntent, *, exposure: ExposureSnapshot | None = None
+    ) -> ExecutionResult:
+        """The decision and acquisition itself.
 
         The gates are checked here rather than trusted to the caller. A gate
         enforced at the call site is a gate that gets forgotten at the next one.
@@ -182,16 +231,22 @@ class Executor:
         assert_transition(result.state, OrderState.SUBMITTING)
         result.state = OrderState.SUBMITTING
 
+        # Recorded before the first order leaves. Everything past this line can
+        # leave a real position at the venue, and a crash between here and the
+        # first response must still be visible to reconciliation.
+        if self._journal is not None:
+            self._journal.opened(intent)
+
         for ticker, limit in intent.legs:
-            outcome = await self._gateway.place(
-                OrderRequest(
-                    idempotency_key=leg_key(intent.intent_id, ticker),
-                    ticker=ticker,
-                    quantity=intent.quantity,
-                    limit_price=limit,
-                )
+            request = OrderRequest(
+                idempotency_key=leg_key(intent.intent_id, ticker),
+                ticker=ticker,
+                quantity=intent.quantity,
+                limit_price=limit,
             )
+            outcome = await self._gateway.place(request)
             result.results.append(outcome)
+            self._record_leg(intent.intent_id, request, outcome, "buy")
 
             if outcome.outcome is OrderOutcome.UNKNOWN:
                 # Stop the whole intent, not just this leg. Buying on is a
@@ -241,15 +296,15 @@ class Executor:
         limits = dict(intent.legs)
 
         for ticker, held in list(result.acquired.items()):
-            sale = await self._gateway.sell(
-                OrderRequest(
-                    idempotency_key=f"{leg_key(intent.intent_id, ticker)}-unwind",
-                    ticker=ticker,
-                    quantity=held,
-                    limit_price=limits[ticker],
-                )
+            request = OrderRequest(
+                idempotency_key=f"{leg_key(intent.intent_id, ticker)}-unwind",
+                ticker=ticker,
+                quantity=held,
+                limit_price=limits[ticker],
             )
+            sale = await self._gateway.sell(request)
             result.results.append(sale)
+            self._record_leg(intent.intent_id, request, sale, "sell")
 
             if sale.outcome is OrderOutcome.UNKNOWN:
                 assert_transition(result.state, OrderState.UNKNOWN)

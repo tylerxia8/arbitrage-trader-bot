@@ -26,6 +26,8 @@ EXPECTED_TABLES = {
     "poll_cycle",
     "venue_lease",
     "evaluation",
+    "order_intent",
+    "leg_order",
 }
 
 

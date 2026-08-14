@@ -436,6 +436,91 @@ class PollCycle(Base):
     __table_args__ = (Index("ix_poll_cycle_channel_completed", "venue", "channel", "completed_ts"),)
 
 
+class OrderIntent(Base):
+    """One attempt to acquire a basket, and where it got to.
+
+    Written **before** the first leg is sent, not after the last one returns.
+    That ordering is the whole point: a process that dies halfway through
+    acquisition has left real positions at the venue, and a record written
+    afterwards would not exist for exactly the intents that most need one.
+    Reconciliation starts from this table, so it has to be pessimistic about
+    its own survival.
+    """
+
+    __tablename__ = "order_intent"
+
+    id: Mapped[BigIntPk]
+    intent_id: Mapped[str] = mapped_column(String(64))
+    """Stable identity across retries and restarts. Leg idempotency keys are
+    derived from it, so reusing one reuses the venue's view of those orders."""
+
+    relationship_slug: Mapped[str] = mapped_column(String(128))
+    state: Mapped[str] = mapped_column(String(32))
+    reason: Mapped[str | None] = mapped_column(String(64))
+    detail: Mapped[str | None] = mapped_column(Text)
+
+    quantity: Mapped[Money]
+    notional: Mapped[Money]
+    """Capital this basket commits if every leg fills. Never netted against the
+    payout -- a payout that has not arrived is not capital."""
+
+    net_edge: Mapped[Money]
+    spent: Mapped[Money] = mapped_column(default=0)
+    recovered: Mapped[Money] = mapped_column(default=0)
+    """Proceeds from unwinding. Kept apart from ``spent`` so a strategy that is
+    profitable except for the cost of getting out cannot look profitable."""
+
+    created_ts: Mapped[Timestamp] = mapped_column(server_default=func.now())
+    updated_ts: Mapped[Timestamp] = mapped_column(server_default=func.now())
+
+    legs: Mapped[list[LegOrder]] = relationship(
+        back_populates="intent", cascade="all, delete-orphan"
+    )
+
+    __table_args__ = (
+        UniqueConstraint("intent_id", name="uq_order_intent_intent_id"),
+        Index("ix_order_intent_state", "state", "updated_ts"),
+    )
+
+
+class LegOrder(Base):
+    """One leg order, and what the venue said about it.
+
+    ``idempotency_key`` is unique **in the database**, not merely generated
+    carefully. A retried submit that fills twice turns one leg of a hedged
+    basket into a directional position, and that is too expensive to defend
+    with discipline alone -- the constraint makes a second insert under the
+    same key fail rather than succeed quietly.
+    """
+
+    __tablename__ = "leg_order"
+
+    id: Mapped[BigIntPk]
+    intent_row_id: Mapped[int] = mapped_column(
+        ForeignKey("order_intent.id", ondelete="CASCADE"), index=True
+    )
+    idempotency_key: Mapped[str] = mapped_column(String(64))
+    ticker: Mapped[str] = mapped_column(String(128))
+    side: Mapped[str] = mapped_column(String(8), default="buy")
+
+    limit_price: Mapped[Money]
+    quantity: Mapped[Money]
+    filled: Mapped[Money] = mapped_column(default=0)
+    cost: Mapped[Money] = mapped_column(default=0)
+
+    outcome: Mapped[str] = mapped_column(String(16))
+    venue_order_id: Mapped[str | None] = mapped_column(String(64))
+    detail: Mapped[str | None] = mapped_column(Text)
+    submitted_ts: Mapped[Timestamp] = mapped_column(server_default=func.now())
+
+    intent: Mapped[OrderIntent] = relationship(back_populates="legs")
+
+    __table_args__ = (
+        UniqueConstraint("idempotency_key", name="uq_leg_order_idempotency_key"),
+        Index("ix_leg_order_ticker", "ticker", "submitted_ts"),
+    )
+
+
 class Evaluation(Base):
     """One pricing decision, accepted or rejected, with its inputs.
 
