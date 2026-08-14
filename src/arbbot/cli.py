@@ -340,6 +340,7 @@ def _survey(
     *,
     demo: bool = False,
     structure_only: bool = False,
+    series: tuple[str, ...] = (),
 ) -> int:
     """Price every structurally-eligible partition the venue currently lists.
 
@@ -391,6 +392,7 @@ def _survey(
             report = await survey_venue(
                 client,
                 max_events=max_events,
+                series=series,
                 price_books=not structure_only,
                 on_progress=progress,
             )
@@ -701,6 +703,15 @@ def main(argv: list[str] | None = None) -> int:
         "would be a number that looks like a finding and is not.",
     )
     survey.add_argument(
+        "--series",
+        nargs="*",
+        default=[],
+        metavar="TICKER",
+        help="price only these series, one request each, instead of paging the whole "
+        "venue. Use this first on a restored connection: the last full sweep from this "
+        "address contributed to losing it.",
+    )
+    survey.add_argument(
         "--structure-only",
         action="store_true",
         help="find verified partitions without fetching any books. Answers where the "
@@ -833,6 +844,7 @@ def main(argv: list[str] | None = None) -> int:
             args.max_events,
             demo=args.demo,
             structure_only=args.structure_only,
+            series=tuple(args.series),
         )
     if args.command == "maker":
         return _maker(args.since_hours, args.event, args.max_leg_age, args.horizon)

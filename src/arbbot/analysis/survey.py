@@ -209,6 +209,7 @@ async def survey_venue(
     max_events: int = 400,
     page_size: int = 200,
     max_pages: int = 40,
+    series: tuple[str, ...] = (),
     max_leg_spread: dt.timedelta = MAX_LEG_SPREAD,
     price_books: bool = True,
     on_progress: Any = None,
@@ -235,6 +236,34 @@ async def survey_venue(
     seen_series: set[str] = set()
     cursor: str | None = None
 
+    # Named series are fetched one request each rather than by paging the whole
+    # venue. For a handful of families that is the cheaper direction by two
+    # orders of magnitude, and the first thing run against a newly restored
+    # address should be small: the last full sweep from here contributed to
+    # losing the address in the first place.
+    if series:
+        for ticker in series:
+            try:
+                body = (
+                    await client.fetch(
+                        "/events",
+                        {
+                            "series_ticker": ticker,
+                            "status": "open",
+                            "with_nested_markets": "true",
+                            "limit": page_size,
+                        },
+                    )
+                ).payload
+            except Exception as exc:
+                report.series_errors.append(f"{ticker}: {type(exc).__name__}")
+                continue
+            _absorb(report, body.get("events") or [], candidates, seen_series)
+            if on_progress:
+                on_progress(f"  {ticker}: {len(candidates)} verified partitions so far")
+        report.series_seen = len(seen_series)
+        return await _price(report, client, candidates, max_leg_spread, price_books, on_progress)
+
     for page in range(max_pages):
         params: dict[str, Any] = {
             "status": "open",
@@ -255,26 +284,7 @@ async def survey_venue(
         if not events:
             break
 
-        for event in events:
-            report.events_seen += 1
-            series = str(event.get("series_ticker") or "")
-            seen_series.add(series)
-            markets = [m for m in event.get("markets") or [] if m.get("status") == "active"]
-            if not classify_event(event, markets).may_propose:
-                report.skipped_structure += 1
-                continue
-            if not check_integer_coverage(markets).covered:
-                report.skipped_coverage += 1
-                continue
-            candidates.append((event, markets))
-            report.structures.append(
-                StructureFinding(
-                    event_ticker=str(event.get("event_ticker", "")),
-                    series=series,
-                    title=str(event.get("title", "")),
-                    legs=len(markets),
-                )
-            )
+        _absorb(report, events, candidates, seen_series)
 
         if on_progress:
             on_progress(
@@ -293,7 +303,47 @@ async def survey_venue(
             break
 
     report.series_seen = len(seen_series)
+    return await _price(report, client, candidates, max_leg_spread, price_books, on_progress)
 
+
+def _absorb(
+    report: SurveyReport,
+    events: list[dict[str, Any]],
+    candidates: list[tuple[dict[str, Any], list[dict[str, Any]]]],
+    seen_series: set[str],
+) -> None:
+    """Classify a page of events, keeping the ones shaped like baskets."""
+    for event in events:
+        report.events_seen += 1
+        series_ticker = str(event.get("series_ticker") or "")
+        seen_series.add(series_ticker)
+        markets = [m for m in event.get("markets") or [] if m.get("status") == "active"]
+        if not classify_event(event, markets).may_propose:
+            report.skipped_structure += 1
+            continue
+        if not check_integer_coverage(markets).covered:
+            report.skipped_coverage += 1
+            continue
+        candidates.append((event, markets))
+        report.structures.append(
+            StructureFinding(
+                event_ticker=str(event.get("event_ticker", "")),
+                series=series_ticker,
+                title=str(event.get("title", "")),
+                legs=len(markets),
+            )
+        )
+
+
+async def _price(
+    report: SurveyReport,
+    client: KalshiRestClient,
+    candidates: list[tuple[dict[str, Any], list[dict[str, Any]]]],
+    max_leg_spread: dt.timedelta,
+    price_books: bool,
+    on_progress: Any,
+) -> SurveyReport:
+    """Fetch each candidate's books and price it, unless pricing is off."""
     if not price_books:
         if on_progress:
             on_progress(f"{len(candidates)} verified partitions found; not pricing")
