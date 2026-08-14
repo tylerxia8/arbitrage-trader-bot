@@ -440,8 +440,9 @@ def _relationships(action: str, args: argparse.Namespace) -> int:
     return 2
 
 
-def _falsify(quantity: str, research: bool) -> int:
+def _falsify(quantity: str, research: bool, since_hours: float | None) -> int:
     """Replay the archive through the detector and report where candidates die."""
+    import datetime as dt
     from decimal import Decimal
 
     from arbbot.analysis.falsification import run_falsification
@@ -456,7 +457,14 @@ def _falsify(quantity: str, research: bool) -> int:
 
     engine = create_engine_from_settings(settings)
     with session_factory(engine)() as session:
-        report = run_falsification(session, quantity=Decimal(quantity), research_mode=research)
+        since = (
+            dt.datetime.now(dt.UTC) - dt.timedelta(hours=since_hours)
+            if since_hours is not None
+            else None
+        )
+        report = run_falsification(
+            session, quantity=Decimal(quantity), research_mode=research, since=since
+        )
 
     print(report.render())
     return 0
@@ -571,6 +579,15 @@ def main(argv: list[str] | None = None) -> int:
         "--quantity", default="10", help="basket size to price (default: 10 contracts)"
     )
     falsify.add_argument(
+        "--since-hours",
+        type=float,
+        default=None,
+        metavar="HOURS",
+        help="only replay the last N hours. Use this to restrict the funnel to the window "
+        "where poll cycles were recorded: outside it, quote age falls back to time-since-change "
+        "and the staleness column means something different.",
+    )
+    falsify.add_argument(
         "--strict",
         action="store_true",
         help="require approved relationships and verified fees; without it the run "
@@ -611,7 +628,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "probe":
         return _probe(args.interval, args.event)
     if args.command == "falsify":
-        return _falsify(args.quantity, not args.strict)
+        return _falsify(args.quantity, not args.strict, args.since_hours)
     if args.command == "coverage":
         return _coverage()
     if args.command == "collect":

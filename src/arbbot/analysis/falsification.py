@@ -195,6 +195,7 @@ def run_falsification(
     shadow: ShadowConfig | None = None,
     research_mode: bool = True,
     starting_capital: Decimal = Decimal("1000"),
+    since: dt.datetime | None = None,
 ) -> FalsificationReport:
     """Replay the archive and report where candidates die.
 
@@ -202,15 +203,16 @@ def run_falsification(
     reviewer had approved them. It is the only way to get a useful funnel
     before anyone has done the review, and the report says so loudly.
     """
-    rows = session.execute(
-        select(
-            BookSnapshot.ticker,
-            BookSnapshot.captured_ts,
-            BookSnapshot.yes_levels,
-            BookSnapshot.no_levels,
-            BookSnapshot.is_complete,
-        ).order_by(BookSnapshot.captured_ts, BookSnapshot.id)
-    ).all()
+    stmt = select(
+        BookSnapshot.ticker,
+        BookSnapshot.captured_ts,
+        BookSnapshot.yes_levels,
+        BookSnapshot.no_levels,
+        BookSnapshot.is_complete,
+    ).order_by(BookSnapshot.captured_ts, BookSnapshot.id)
+    if since is not None:
+        stmt = stmt.where(BookSnapshot.captured_ts >= since)
+    rows = session.execute(stmt).all()
 
     legs_by_event: dict[str, set[str]] = {}
     for ticker, *_ in rows:
@@ -241,7 +243,9 @@ def run_falsification(
         window=(rows[0][1], rows[-1][1]) if rows else (None, None),
     )
     shadow_config = shadow or ShadowConfig()
-    confirmations = ConfirmationIndex(session)
+    # Windowed with the rows: reading confirmations from outside the window
+    # would credit a leg with a poll that no pricing here can see.
+    confirmations = ConfirmationIndex(session, since=since)
     report.confirmations_available = bool(confirmations)
 
     for threshold in staleness_thresholds:
