@@ -11,6 +11,8 @@ from arbbot.registry.proposal import (
     pending,
     propose_from_events,
     review_fingerprint,
+    review_templates,
+    rules_template,
     slug_for,
 )
 from arbbot.registry.service import RegistryError, RelationshipRegistry, UsabilityCheck
@@ -27,5 +29,7 @@ __all__ = [
     "pending",
     "propose_from_events",
     "review_fingerprint",
+    "review_templates",
+    "rules_template",
     "slug_for",
 ]

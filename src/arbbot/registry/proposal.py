@@ -34,6 +34,7 @@ from __future__ import annotations
 import datetime as dt
 import hashlib
 import json
+import re
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -54,6 +55,8 @@ __all__ = [
     "pending",
     "propose_from_events",
     "review_fingerprint",
+    "review_templates",
+    "rules_template",
     "slug_for",
 ]
 
@@ -63,34 +66,75 @@ def slug_for(event_ticker: str) -> str:
     return f"kalshi:{event_ticker}"
 
 
+_DIGITS = re.compile(r"\d+")
+#: Full and abbreviated month names. The venue writes both -- "August 13, 2026"
+#: in one series and "Aug 14, 2026" in another -- and masking only the long form
+#: leaves two instances of the same claim looking like different claims.
+_MONTHS = re.compile(
+    r"\b(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)"
+    r"(uary|ruary|ch|il|e|y|ust|tember|ober|ember)?\b",
+    re.IGNORECASE,
+)
+
+
+def rules_template(text: str) -> str:
+    """A settlement rule with its instance parameters masked out.
+
+    ``"...in Dallas for August 14, 2026 ... is between 101-102°..."`` becomes
+    ``"...in Dallas for <MONTH> #, # ... is between #-#°..."``.
+
+    Masking is a judgement, so it is worth being exact about which one. Dates
+    and strike numbers are the parameters that make one day's Dallas partition
+    a different instance of the same claim; everything else -- the city, the
+    reporting agency, the report name, whether it says highest or lowest -- is
+    left alone, because those are what make it a *different* claim. "Highest
+    temperature in Dallas" and "lowest temperature in Dallas" contain no
+    differing digits and still mask apart, which is the property that matters.
+
+    The masked text is stored on the draft, so a reviewer can see exactly what
+    was treated as an instance parameter rather than taking it on trust.
+    """
+    collapsed = " ".join(text.split())
+    return _DIGITS.sub("#", _MONTHS.sub("<MONTH>", collapsed))
+
+
+def review_templates(markets: list[dict[str, Any]]) -> list[str]:
+    """The distinct masked rules a reviewer would read for this event.
+
+    Deduplicated: six temperature buckets produce three templates, because the
+    four interior buckets differ only in their strike numbers and mask to the
+    same sentence. That is the point -- it is one rule read three ways, not
+    six.
+    """
+    return sorted({rules_template(str(m.get("rules_primary") or "")) for m in markets} - {""})
+
+
 def review_fingerprint(markets: list[dict[str, Any]]) -> str:
     """Hash of what a reviewer actually reads, ignoring which day it is.
 
     A single proposal pass drafts one relationship per live event, and daily
-    temperature markets rotate: eighty-odd drafts, of which "Dallas high on the
-    14th" and "Dallas high on the 15th" differ only in expiry and strike
-    numbers. Asking someone to read eighty separate settlement rules is how
-    approval-by-fatigue happens, and a reviewer who stops reading is worse than
-    no reviewer, because the record still says a person signed.
+    temperature markets rotate: the first live run produced eighty drafts, of
+    which "Dallas high on the 14th" and "Dallas high on the 15th" differ only
+    in expiry and strike numbers. Asking someone to read eighty separate
+    settlement rules is how approval-by-fatigue happens, and a reviewer who has
+    stopped reading is worse than no reviewer, because the record still says a
+    person signed.
 
-    So this fingerprints the *rules text and bucket shape* rather than the
-    instance. Two events with the same fingerprint are the same claim asked
-    about different days, and one reading answers both.
+    So this fingerprints the *masked rules text, bucket shape and leg count*
+    rather than the instance. Two events with the same fingerprint are the same
+    claim asked about different days, and one reading answers both.
 
     It deliberately does **not** replace per-relationship approval. Each event
     still gets its own approval row, its own reviewer name, and its own binding
     to its own terms hashes -- this only lets one act of reading cover the set
     it genuinely covers. The guarantee is unchanged; the clerical work is not.
     """
-    material = [
-        {
-            "strike_type": str(m.get("strike_type") or ""),
-            "rules_primary": " ".join(str(m.get("rules_primary") or "").split()),
-            "settlement_source": str(m.get("settlement_source") or ""),
-        }
-        for m in markets
-    ]
-    material.sort(key=lambda entry: (entry["strike_type"], entry["rules_primary"]))
+    material = {
+        "legs": len(markets),
+        "strike_types": sorted(str(m.get("strike_type") or "") for m in markets),
+        "templates": review_templates(markets),
+        "settlement_sources": sorted({str(m.get("settlement_source") or "") for m in markets}),
+    }
     encoded = json.dumps(material, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
@@ -183,6 +227,10 @@ def _payout_proof(
             "pays exactly $1.00 whatever the outcome"
         ),
         "review_fingerprint": review_fingerprint(markets),
+        # The masked rules the fingerprint was taken over, so a reviewer can see
+        # what was treated as an instance parameter rather than trust that it was
+        # only the date and the strikes.
+        "rules_templates": review_templates(markets),
         "event_title": event.get("title"),
         "structure": "numeric buckets with both tails",
         "integer_coverage": coverage_summary,
@@ -243,13 +291,27 @@ def propose_from_events(
             str(market["ticker"]): normalize_kalshi_market(market).terms_hash for market in markets
         }
 
+        proof = _payout_proof(event, markets, coverage.summary)
         existing = registry.latest(slug_for(ticker))
         if existing is not None and dict(existing.dependency_hashes) == hashes:
-            report.outcomes.append(
-                ProposalOutcome(
-                    ticker, "unchanged", "leg set and terms match the latest version", len(markets)
-                )
-            )
+            detail = "leg set and terms match the latest version"
+            if (
+                existing.status is RelationshipStatus.PENDING
+                and dict(existing.payout_proof) != proof
+            ):
+                # Refresh the case being presented, not the binding. The
+                # dependency hashes are what an approval is bound to and they
+                # have not moved; payout_proof is the evidence put in front of a
+                # reviewer, and a draft nobody has signed should show the
+                # current best version of it -- otherwise a draft written before
+                # this system learned to fingerprint stays unreviewable forever.
+                #
+                # Deliberately never on an APPROVED record: rewriting what a
+                # reviewer saw after they signed would forge the audit trail.
+                existing.payout_proof = proof
+                session.flush()
+                detail = "unchanged; restated the case for review"
+            report.outcomes.append(ProposalOutcome(ticker, "unchanged", detail, len(markets)))
             continue
 
         if existing is not None and existing.status is RelationshipStatus.APPROVED:
@@ -273,7 +335,7 @@ def propose_from_events(
             slug=slug_for(ticker),
             relationship_type=RelationshipType.INTERVAL_PARTITION,
             legs=_leg_definitions(markets),
-            payout_proof=_payout_proof(event, markets, coverage.summary),
+            payout_proof=proof,
             dependency_hashes=hashes,
             notes=f"proposed from venue structure at {(now or dt.datetime.now(dt.UTC)):%Y-%m-%d %H:%M}Z",
         )
@@ -309,14 +371,18 @@ def fingerprint_of(record: RelationshipRecord) -> str:
 def group_pending(session: Session) -> dict[str, list[RelationshipRecord]]:
     """Pending relationships grouped by what a reviewer would have to read.
 
-    Records drafted before fingerprints existed group under the empty string
-    and are therefore never merged with anything -- an unfingerprinted draft
-    makes no claim about resembling another, and guessing that it does would be
-    the one shortcut this whole path exists to refuse.
+    A record with no fingerprint gets a group of its own rather than joining
+    the other unfingerprinted ones. Unknown is not the same as same: the first
+    version of this collapsed eighty drafts that had never recorded a
+    fingerprint into a single row reading "80 events, 1 distinct claim", which
+    is precisely the false reassurance this path exists to refuse. They are
+    keyed on their own slug so they stay separate and stay visible.
     """
     groups: dict[str, list[RelationshipRecord]] = {}
     for record in pending(session):
-        groups.setdefault(fingerprint_of(record), []).append(record)
+        fingerprint = fingerprint_of(record)
+        key = fingerprint or f"unfingerprinted:{record.slug}"
+        groups.setdefault(key, []).append(record)
     return groups
 
 

@@ -21,6 +21,8 @@ from arbbot.registry import (
     pending,
     propose_from_events,
     review_fingerprint,
+    review_templates,
+    rules_template,
     slug_for,
 )
 from arbbot.relationships import RelationshipStatus
@@ -198,6 +200,106 @@ class TestSuspension:
 
         propose_from_events(session, [event(partition())])
         assert approved.status.may_qualify is True, "an untouched approval still qualifies"
+
+
+NWS = (
+    "If the highest temperature recorded in Dallas Love Field for {date}, "
+    "as reported by the National Weather Service's Climatological Report "
+    "(Daily), is between {lo}-{hi} degrees, then the market resolves to Yes."
+)
+
+
+class TestMasking:
+    """Which parts of a settlement rule are the *instance*, and which are the
+    *claim*. Getting this wrong in the permissive direction merges two rules
+    that settle differently; getting it wrong in the strict direction merges
+    nothing and the grouping is pointless. The first live run hit the strict
+    failure: every rule embeds its own date and strikes, so nothing grouped.
+    """
+
+    def test_the_date_and_strikes_are_masked(self) -> None:
+        a = rules_template(NWS.format(date="August 14, 2026", lo="101", hi="102"))
+        b = rules_template(NWS.format(date="September 3, 2027", lo="88", hi="89"))
+        assert a == b
+
+    def test_abbreviated_months_mask_the_same_as_long_ones(self) -> None:
+        """The venue writes both. One series says "August 13, 2026" and another
+        says "Aug 14, 2026", and masking only the long form leaves two
+        instances of one claim looking like two claims."""
+        assert rules_template(NWS.format(date="Aug 14, 2026", lo="101", hi="102")) == (
+            rules_template(NWS.format(date="August 14, 2026", lo="101", hi="102"))
+        )
+
+    def test_the_city_is_not_masked(self) -> None:
+        a = rules_template(NWS.format(date="August 14, 2026", lo="101", hi="102"))
+        b = rules_template(
+            NWS.replace("Dallas Love Field", "Chicago Midway").format(
+                date="August 14, 2026", lo="101", hi="102"
+            )
+        )
+        assert a != b
+
+    def test_highest_and_lowest_do_not_mask_together(self) -> None:
+        """The failure that would matter: two rules with no differing digits
+        that nonetheless settle from opposite readings of the same day."""
+        a = rules_template(NWS.format(date="August 14, 2026", lo="101", hi="102"))
+        b = rules_template(
+            NWS.replace("highest", "lowest").format(date="August 14, 2026", lo="101", hi="102")
+        )
+        assert a != b
+
+    def test_the_settlement_source_is_not_masked(self) -> None:
+        a = rules_template(NWS.format(date="August 14, 2026", lo="101", hi="102"))
+        b = rules_template(
+            NWS.replace("National Weather Service", "Some Other Agency").format(
+                date="August 14, 2026", lo="101", hi="102"
+            )
+        )
+        assert a != b
+
+    def test_interior_buckets_collapse_to_one_template(self) -> None:
+        """Six buckets are one rule read three ways, not six."""
+        markets = [
+            {"rules_primary": NWS.format(date="August 14, 2026", lo=lo, hi=hi)}
+            for lo, hi in (("99", "100"), ("101", "102"), ("103", "104"))
+        ]
+        assert len(review_templates(markets)) == 1
+
+    def test_the_draft_shows_what_was_masked(self, session: Session) -> None:
+        """A reviewer should be able to see what was treated as an instance
+        parameter rather than take it on trust."""
+        propose_from_events(session, [event(partition())])
+        record = RelationshipRegistry(session).latest(slug_for(EVENT_TICKER))
+
+        assert record is not None
+        assert dict(record.payout_proof)["rules_templates"]
+
+
+class TestUnfingerprintedGrouping:
+    def test_records_without_a_fingerprint_do_not_group_together(self, session: Session) -> None:
+        """Unknown is not the same as same. The first version of this collapsed
+        eighty drafts that had never recorded a fingerprint into one row
+        reading "80 events, 1 distinct claim"."""
+        propose_from_events(session, [event(partition())])
+        for record in pending(session):
+            record.payout_proof = {"claim": "no fingerprint here"}
+        propose_from_events(
+            session,
+            [
+                (
+                    {"event_ticker": "KXHIGHOTHER-26AUG14", "mutually_exclusive": True},
+                    [
+                        dict(m, ticker=m["ticker"].replace("HIGHTEST", "HIGHOTHER"))
+                        for m in partition()
+                    ],
+                )
+            ],
+        )
+        for record in pending(session):
+            record.payout_proof = {"claim": "no fingerprint here"}
+        session.flush()
+
+        assert len(group_pending(session)) == 2
 
 
 class TestGroupedReview:

@@ -383,9 +383,11 @@ def _relationships(action: str, args: argparse.Namespace) -> int:
                 print(f"    coverage       : {proof.get('integer_coverage', '')}")
                 for item in proof.get("reviewer_must_confirm", []):
                     print(f"    confirm        : {item}")
-                rules = {str(b.get("rules_primary") or "") for b in proof.get("boundaries", [])}
-                for text_ in sorted(r for r in rules if r):
-                    print(f"    rules          : {text_[:300]}")
+                # The masked templates, not the raw rules: these are what the
+                # fingerprint was taken over, so showing anything else would ask
+                # the reviewer to check one thing and sign for another.
+                for template in proof.get("rules_templates", []):
+                    print(f"    rule (masked)  : {template[:240]}")
                 print("    events         : " + ", ".join(sorted(r.slug for r in records[:6])))
                 if len(records) > 6:
                     print(f"                     ...and {len(records) - 6} more")
