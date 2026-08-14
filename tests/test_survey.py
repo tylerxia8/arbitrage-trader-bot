@@ -190,6 +190,110 @@ class TestPricingRefusals:
         assert report.skipped_stale == 1
 
 
+class TestEnumeration:
+    """Events are paged directly rather than walked series by series.
+
+    The venue lists over thirteen thousand series. One /events call each is
+    thirteen thousand requests before a single book is fetched, and that design
+    was a meaningful part of what got this address blocked.
+    """
+
+    async def test_the_whole_sweep_costs_one_request_per_page(self) -> None:
+        calls: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            calls.append(request.url.path)
+            if request.url.path.endswith("/events"):
+                return httpx.Response(
+                    200,
+                    json={
+                        "events": [
+                            {
+                                "event_ticker": "KXTEST-26AUG14",
+                                "series_ticker": "KXTEST",
+                                "mutually_exclusive": True,
+                                "markets": PARTITION,
+                            }
+                        ]
+                    },
+                )
+            return httpx.Response(
+                200, json={"orderbook": {"yes": [["0.25", "5"]], "no": [["0.70", "5"]]}}
+            )
+
+        client = KalshiRestClient(
+            client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+            requests_per_second=10_000,
+            max_attempts=1,
+        )
+        async with client:
+            report = await survey_venue(client, price_books=False)
+
+        assert len(report.structures) == 1
+        assert sum(1 for c in calls if c.endswith("/events")) == 1
+        assert not any(c.endswith("/series") for c in calls), "no per-series walk"
+
+    async def test_a_cursor_that_stops_advancing_ends_the_sweep(self) -> None:
+        """A server echoing the same cursor forever would otherwise spin until
+        the rate limiter turned it into a very slow infinite loop."""
+        pages = 0
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal pages
+            pages += 1
+            return httpx.Response(
+                200,
+                json={
+                    "cursor": "always-the-same",
+                    "events": [
+                        {
+                            "event_ticker": "KXTEST-26AUG14",
+                            "series_ticker": "KXTEST",
+                            "mutually_exclusive": True,
+                            "markets": PARTITION,
+                        }
+                    ],
+                },
+            )
+
+        client = KalshiRestClient(
+            client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+            requests_per_second=10_000,
+            max_attempts=1,
+        )
+        async with client:
+            await survey_venue(client, price_books=False, max_pages=50)
+
+        assert pages == 2, "one page, then the repeated cursor stops it"
+
+    async def test_pages_are_capped(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                json={
+                    "cursor": f"c{id(request)}",
+                    "events": [
+                        {
+                            "event_ticker": f"KXTEST-{id(request)}",
+                            "series_ticker": "KXTEST",
+                            "mutually_exclusive": True,
+                            "markets": PARTITION,
+                        }
+                    ],
+                },
+            )
+
+        client = KalshiRestClient(
+            client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+            requests_per_second=10_000,
+            max_attempts=1,
+        )
+        async with client:
+            report = await survey_venue(client, price_books=False, max_pages=3, max_events=10_000)
+
+        assert report.events_seen == 3
+
+
 class TestReport:
     async def test_the_report_states_it_is_one_moment(self) -> None:
         async with venue(PARTITION) as client:
@@ -203,16 +307,10 @@ class TestReport:
             rendered = (await survey_venue(client)).render()
         assert "Nothing on this venue priced" in rendered
 
-    async def test_a_broken_series_is_counted_not_swallowed(self) -> None:
+    async def test_a_failed_page_is_counted_not_swallowed(self) -> None:
         """A systematic failure must not hide behind a small "priced" number."""
-
-        def handler(request: httpx.Request) -> httpx.Response:
-            if request.url.path.endswith("/series"):
-                return httpx.Response(200, json={"series": [{"ticker": "KXTEST"}]})
-            return httpx.Response(500)
-
         client = KalshiRestClient(
-            client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+            client=httpx.AsyncClient(transport=httpx.MockTransport(lambda r: httpx.Response(500))),
             requests_per_second=10_000,
             max_attempts=1,
         )
@@ -220,4 +318,5 @@ class TestReport:
             report = await survey_venue(client)
 
         assert len(report.series_errors) == 1
-        assert "KXTEST" in report.series_errors[0]
+        assert "page 0" in report.series_errors[0]
+        assert report.priced == []

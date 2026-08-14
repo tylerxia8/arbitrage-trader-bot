@@ -206,9 +206,9 @@ def _best_price(levels: list[list[str]] | None) -> tuple[Decimal, Decimal] | Non
 async def survey_venue(
     client: KalshiRestClient,
     *,
-    categories: list[str] | None = None,
-    events_per_series: int = 2,
     max_events: int = 400,
+    page_size: int = 200,
+    max_pages: int = 40,
     max_leg_spread: dt.timedelta = MAX_LEG_SPREAD,
     price_books: bool = True,
     on_progress: Any = None,
@@ -224,48 +224,41 @@ async def survey_venue(
     """
     report = SurveyReport(priced_books=price_books)
 
-    series_bodies: list[dict[str, Any]] = []
-    for category in categories or [None]:  # type: ignore[list-item]
-        params = {"category": category} if category else {}
-        body = (await client.fetch("/series", params)).payload
-        series_bodies.extend(body.get("series") or [])
-
-    # dict.fromkeys rather than a set: the sweep order decides which series get
-    # priced when the cap bites, and an arbitrary order would silently change
-    # which part of the venue was examined between two runs.
-    series_tickers = list(
-        dict.fromkeys(
-            s["ticker"] for s in series_bodies if isinstance(s.get("ticker"), str) and s["ticker"]
-        )
-    )
-    report.series_seen = len(series_tickers)
-
+    # Events are paged directly rather than walked series by series. The
+    # difference is not a nicety: this venue lists over thirteen thousand
+    # series, so one /events call each is thirteen thousand requests before a
+    # single book is fetched -- three quarters of an hour of pure enumeration,
+    # and a meaningful part of what got this address blocked. Paging /events
+    # returns thousands of events per request. Same answer, three orders of
+    # magnitude fewer calls.
     candidates: list[tuple[dict[str, Any], list[dict[str, Any]]]] = []
-    for ticker in series_tickers:
-        if len(candidates) >= max_events:
-            break
-        try:
-            body = (
-                await client.fetch(
-                    "/events",
-                    {
-                        "series_ticker": ticker,
-                        "limit": events_per_series,
-                        "with_nested_markets": "true",
-                        "status": "open",
-                    },
-                )
-            ).payload
-        except Exception as exc:
-            # A sweep over hundreds of series will meet a few that error, and
-            # losing the whole survey to one of them would be absurd. Counted
-            # and named rather than swallowed, so a systematic failure cannot
-            # hide as a small "priced" number.
-            report.series_errors.append(f"{ticker}: {type(exc).__name__}")
-            continue
+    seen_series: set[str] = set()
+    cursor: str | None = None
 
-        for event in body.get("events") or []:
+    for page in range(max_pages):
+        params: dict[str, Any] = {
+            "status": "open",
+            "with_nested_markets": "true",
+            "limit": page_size,
+        }
+        if cursor:
+            params["cursor"] = cursor
+        try:
+            body = (await client.fetch("/events", params)).payload
+        except Exception as exc:
+            # Counted and named rather than swallowed, so a systematic failure
+            # cannot hide behind a small "priced" number.
+            report.series_errors.append(f"page {page}: {type(exc).__name__}")
+            break
+
+        events = body.get("events") or []
+        if not events:
+            break
+
+        for event in events:
             report.events_seen += 1
+            series = str(event.get("series_ticker") or "")
+            seen_series.add(series)
             markets = [m for m in event.get("markets") or [] if m.get("status") == "active"]
             if not classify_event(event, markets).may_propose:
                 report.skipped_structure += 1
@@ -277,11 +270,29 @@ async def survey_venue(
             report.structures.append(
                 StructureFinding(
                     event_ticker=str(event.get("event_ticker", "")),
-                    series=str(event.get("series_ticker") or ticker),
+                    series=series,
                     title=str(event.get("title", "")),
                     legs=len(markets),
                 )
             )
+
+        if on_progress:
+            on_progress(
+                f"  page {page + 1}: {report.events_seen:,} events, "
+                f"{len(candidates):,} verified partitions"
+            )
+
+        # Stops when the cursor empties *and* when it stops advancing. A server
+        # echoing the same cursor forever would otherwise spin here until the
+        # rate limiter turned it into a very slow infinite loop.
+        next_cursor = body.get("cursor")
+        if not next_cursor or next_cursor == cursor:
+            break
+        cursor = str(next_cursor)
+        if len(candidates) >= max_events:
+            break
+
+    report.series_seen = len(seen_series)
 
     if not price_books:
         if on_progress:

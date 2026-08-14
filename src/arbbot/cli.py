@@ -336,7 +336,6 @@ def _probe(interval: float, event_ticker: str | None) -> int:
 
 def _survey(
     limit: int,
-    events_per_series: int,
     max_events: int,
     *,
     demo: bool = False,
@@ -391,7 +390,6 @@ def _survey(
             progress(f"sweeping {base_url} for verified partitions...")
             report = await survey_venue(
                 client,
-                events_per_series=events_per_series,
                 max_events=max_events,
                 price_books=not structure_only,
                 on_progress=progress,
@@ -691,9 +689,7 @@ def main(argv: list[str] | None = None) -> int:
         "survey", help="price every verified partition on the venue, once, to see where room is"
     )
     survey.add_argument("--limit", type=int, default=20, help="rows to show")
-    survey.add_argument(
-        "--events-per-series", type=int, default=2, help="events to take from each series"
-    )
+
     survey.add_argument(
         "--max-events", type=int, default=400, help="cap on partitions priced in one sweep"
     )
@@ -834,7 +830,6 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "survey":
         return _survey(
             args.limit,
-            args.events_per_series,
             args.max_events,
             demo=args.demo,
             structure_only=args.structure_only,
