@@ -33,7 +33,7 @@ from sqlalchemy import (
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
-from arbbot.db.base import Base, BigIntPk, Json, Money, Sha256, Timestamp
+from arbbot.db.base import Base, BigIntPk, Json, JsonList, Money, Sha256, Timestamp
 from arbbot.relationships import ApprovalDecision, RelationshipStatus, RelationshipType
 
 __all__ = [
@@ -41,6 +41,7 @@ __all__ = [
     "AuditEvent",
     "Evaluation",
     "Market",
+    "PollCycle",
     "RawMessage",
     "RelationshipRecord",
     "TermsVersion",
@@ -324,6 +325,59 @@ class FeedHealth(Base):
     __table_args__ = (
         Index("ix_feed_health_stream_observed", "venue", "subscription_key", "observed_ts"),
     )
+
+
+class PollCycle(Base):
+    """One pass of a poller over its markets, and which of them it confirmed.
+
+    This exists because :class:`BookSnapshot` records when a book *changed*,
+    not when it was *observed*. Unchanged polls are deliberately not
+    re-archived -- storing thousands of byte-identical books would bloat the
+    archive without adding evidence -- and the consequence was invisible until
+    the fast-poll probe ran: an analysis reading ``captured_ts`` as the quote's
+    age charges a leg for every second since it last moved, even while a poller
+    was confirming it current every second.
+
+    That is not a small distortion. On a one-second probe of a live temperature
+    partition, the median gap between changes was three to four seconds and the
+    longest ran past twelve minutes, so a two-second freshness gate rejected
+    almost everything on staleness that was in fact freshly confirmed. Any
+    finding of the form "the edge was gone before we could see it" is
+    uninterpretable without this table.
+
+    One row per cycle rather than per market: a cycle is the unit that confirms,
+    the tickers ride along as an array, and a seven-day run costs thousands of
+    rows instead of hundreds of thousands.
+
+    Append-only, like the raw archive. A mutable "last confirmed" column would
+    be smaller and would make replay a lie -- evaluating the archive at a past
+    moment would read a confirmation from that moment's future.
+    """
+
+    __tablename__ = "poll_cycle"
+
+    id: Mapped[BigIntPk]
+    venue: Mapped[str] = mapped_column(String(32))
+    channel: Mapped[str] = mapped_column(String(64))
+    """Which poller. The 1s probe and the 30s collector confirm independently
+    and must not be read as one stream (see ``collector.PROBE_CHANNEL``)."""
+
+    started_ts: Mapped[Timestamp] = mapped_column(server_default=func.now())
+    completed_ts: Mapped[Timestamp] = mapped_column(server_default=func.now())
+    """When the cycle finished. Freshness is measured from this rather than
+    from ``started_ts``: a leg polled at the end of a slow cycle was confirmed
+    then, and crediting it with the cycle's start time would overstate how
+    fresh it was -- the direction that invents edge."""
+
+    confirmed: Mapped[JsonList] = mapped_column(default=list)
+    """Tickers this cycle polled successfully, changed or not."""
+
+    failed: Mapped[JsonList] = mapped_column(default=list)
+    """Tickers whose poll failed. Recorded rather than omitted, so a silent
+    absence from ``confirmed`` cannot be mistaken for a market that was simply
+    not in the universe yet."""
+
+    __table_args__ = (Index("ix_poll_cycle_channel_completed", "venue", "channel", "completed_ts"),)
 
 
 class Evaluation(Base):

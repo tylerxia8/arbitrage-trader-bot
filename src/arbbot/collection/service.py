@@ -16,6 +16,11 @@ than minutes:
 *   **Health is sampled on a timer, not per message.** A collector that has
     stopped writes nothing at all, which is indistinguishable from a quiet
     market unless something independent is recording the silence.
+*   **Every cycle records what it confirmed.** Unchanged books are not
+    re-archived, so ``book_snapshot`` says when a book last *moved*, not when
+    it was last *seen*. Without :class:`~arbbot.db.models.PollCycle` any
+    freshness measurement charges a quiet market for its quiet, and reads a
+    leg confirmed a second ago as minutes stale.
 *   **The market set is refreshed, not fixed.** The recommended universe is
     daily temperature partitions, and they rotate: yesterday's Atlanta event
     already has zero active markets. A collector started on Monday with a
@@ -41,6 +46,7 @@ from arbbot.collection.collector import (
     PollOutcome,
 )
 from arbbot.collection.health import utc_now
+from arbbot.db.models import PollCycle
 from arbbot.venues.kalshi import KalshiAdapter
 from arbbot.venues.kalshi.rest import KalshiRestClient
 
@@ -217,6 +223,9 @@ class CollectionService:
         if self._should_refresh(at):
             report.refresh = await self.refresh_markets(now=at)
 
+        confirmed: list[str] = []
+        failed: list[str] = []
+
         with self._session_factory() as session:
             for collector in self.collectors:
                 # Pass the cycle's clock down so an injected time governs the
@@ -227,12 +236,35 @@ class CollectionService:
                 match result.outcome:
                     case PollOutcome.STORED:
                         report.stored += 1
+                        confirmed.append(result.ticker)
                     case PollOutcome.UNCHANGED:
                         report.unchanged += 1
+                        # The row this cycle exists for. An unchanged poll is
+                        # the only evidence that a book which has not moved in
+                        # ten minutes is nonetheless current, and without it
+                        # every freshness gate reads quiet as dead.
+                        confirmed.append(result.ticker)
                     case PollOutcome.FAILED:
                         report.failed += 1
+                        failed.append(result.ticker)
                         if result.error:
                             report.errors.append(f"{result.ticker}: {result.error}")
+
+            completed = now or utc_now()
+            session.add(
+                PollCycle(
+                    venue=self._adapter.venue,
+                    channel=self._channel,
+                    started_ts=at,
+                    # Measured at the end, not the start: a leg polled at the
+                    # close of a slow cycle was confirmed then, and crediting
+                    # it with the cycle's start time overstates its freshness
+                    # -- the direction that invents edge.
+                    completed_ts=completed,
+                    confirmed=confirmed,
+                    failed=failed,
+                )
+            )
 
             if self._should_sample_health(at):
                 # Stamped after polling, not at cycle start: messages arrive

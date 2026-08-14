@@ -14,7 +14,7 @@ from decimal import Decimal
 from sqlalchemy.orm import Session
 
 from arbbot.analysis.falsification import run_falsification
-from arbbot.db.models import BookSnapshot
+from arbbot.db.models import BookSnapshot, PollCycle
 from arbbot.reasons import RejectionReason
 
 D = Decimal
@@ -49,6 +49,21 @@ def snap(
 def cheap_basket(session: Session, at: dt.datetime = T0, ask: str = "0.20") -> None:
     for leg in ("A", "B", "C"):
         snap(session, leg, yes_ask=ask, at=at)
+
+
+def confirm(session: Session, legs: tuple[str, ...], *, at: dt.datetime) -> None:
+    """Record a poll cycle that saw ``legs``, changed or not."""
+    session.add(
+        PollCycle(
+            venue="kalshi",
+            channel="orderbook_poll",
+            started_ts=at,
+            completed_ts=at,
+            confirmed=[f"{EVENT}-{leg}" for leg in legs],
+            failed=[],
+        )
+    )
+    session.flush()
 
 
 def approve_the_test_basket(session: Session, legs: tuple[str, ...] = ("A", "B", "C")) -> None:
@@ -126,6 +141,54 @@ class TestStalenessSweep:
         thresholds = (dt.timedelta(seconds=1), dt.timedelta(seconds=10), dt.timedelta(minutes=5))
         report = run_falsification(session, staleness_thresholds=thresholds)
         assert [s.max_age for s in report.slices] == list(thresholds)
+
+
+class TestConfirmedFreshness:
+    """The correction to this report's first verdict.
+
+    Its headline was that 91% of candidates died on quote age at two seconds,
+    read as "the instrument is too slow to see executable edge". But quote age
+    was measured from the last time a book *changed*, and the archive stores a
+    snapshot only on change -- so a market confirmed every second but quoted
+    flat for ten minutes reported ten minutes of staleness. The gate was
+    counting quiet, not latency.
+    """
+
+    def test_a_quiet_leg_dies_on_staleness_without_a_poll_record(self, session: Session) -> None:
+        snap(session, "A", yes_ask="0.20", at=T0)
+        snap(session, "B", yes_ask="0.20", at=T0)
+        snap(session, "C", yes_ask="0.20", at=T0 + dt.timedelta(minutes=5))
+
+        report = run_falsification(
+            session, quantity=D("10"), staleness_thresholds=(dt.timedelta(seconds=2),)
+        )
+        assert report.confirmations_available is False
+        assert report.slices[0].accepted == 0
+        assert report.slices[0].dominant_reason == str(RejectionReason.STALE_QUOTE)
+
+    def test_the_same_archive_qualifies_once_confirmations_exist(self, session: Session) -> None:
+        """Identical books, identical prices, opposite verdict -- the whole
+        difference is knowing the poller was still looking."""
+        snap(session, "A", yes_ask="0.20", at=T0)
+        snap(session, "B", yes_ask="0.20", at=T0)
+        later = T0 + dt.timedelta(minutes=5)
+        confirm(session, ("A", "B", "C"), at=later - dt.timedelta(seconds=1))
+        snap(session, "C", yes_ask="0.20", at=later)
+
+        report = run_falsification(
+            session, quantity=D("10"), staleness_thresholds=(dt.timedelta(seconds=2),)
+        )
+        assert report.confirmations_available is True
+        assert report.slices[0].accepted >= 1
+
+    def test_the_report_says_which_measure_it_used(self, session: Session) -> None:
+        """A staleness column means two different things depending on this, so
+        the report may not leave a reader to guess which."""
+        cheap_basket(session)
+        assert "last CHANGE" in run_falsification(session).render()
+
+        confirm(session, ("A", "B", "C"), at=T0)
+        assert "confirmed the leg" in run_falsification(session).render()
 
 
 class TestStrictMode:

@@ -13,7 +13,7 @@ from decimal import Decimal
 from sqlalchemy.orm import Session
 
 from arbbot.analysis.baskets import event_of, scan_baskets
-from arbbot.db.models import BookSnapshot
+from arbbot.db.models import BookSnapshot, PollCycle
 
 T0 = dt.datetime(2026, 8, 13, 12, 0, tzinfo=dt.UTC)
 EVENT = "KXHIGHTEST-26AUG13"
@@ -59,6 +59,21 @@ def full_set(
 ) -> None:
     for index, ask in enumerate(asks):
         snap(session, f"L{index}", yes_ask=ask, at=at, complete=complete)
+
+
+def confirm(session: Session, legs: tuple[str, ...], *, at: dt.datetime) -> None:
+    """Record a poll cycle that saw ``legs``, changed or not."""
+    session.add(
+        PollCycle(
+            venue="kalshi",
+            channel="orderbook_poll",
+            started_ts=at,
+            completed_ts=at,
+            confirmed=[f"{EVENT}-{leg}" for leg in legs],
+            failed=[],
+        )
+    )
+    session.flush()
 
 
 class TestPricing:
@@ -107,6 +122,75 @@ class TestStaleness:
 
         assert scan_baskets(session).observations == []
         assert scan_baskets(session, max_leg_age=dt.timedelta(minutes=10)).observations
+
+
+class TestConfirmation:
+    """Quote age is time since the leg was last *seen*, not last *changed*.
+
+    The archive stores a snapshot only when a book moves. Reading ``captured_ts``
+    as the quote's age charges a quiet market for its quiet -- and on a live
+    one-second probe of a real partition, the median gap between changes was
+    three to four seconds and the longest ran past twelve minutes. A two-second
+    freshness gate therefore rejected almost everything as stale that had in
+    fact just been confirmed, which is how a measurement artefact came to look
+    like a verdict about latency.
+    """
+
+    def test_a_quiet_leg_is_stale_without_a_poll_record(self, session: Session) -> None:
+        """The old behaviour, kept as the fallback: an archive with no cycle
+        record genuinely cannot prove a quiet book was being watched."""
+        snap(session, "L0", yes_ask="0.30", at=T0)
+        snap(session, "L1", yes_ask="0.30", at=T0)
+        snap(session, "L2", yes_ask="0.30", at=T0 + dt.timedelta(minutes=5))
+
+        result = scan_baskets(session, max_leg_age=dt.timedelta(seconds=2))
+        assert result.observations == []
+        assert result.skipped_stale >= 1
+        assert result.confirmations_available is False
+
+    def test_a_confirmed_quiet_leg_is_fresh(self, session: Session) -> None:
+        """The correction. L0 and L1 have not moved in five minutes and were
+        confirmed a second before the evaluation, so they are one second old."""
+        snap(session, "L0", yes_ask="0.30", at=T0)
+        snap(session, "L1", yes_ask="0.30", at=T0)
+        later = T0 + dt.timedelta(minutes=5)
+        confirm(session, ("L0", "L1", "L2"), at=later - dt.timedelta(seconds=1))
+        snap(session, "L2", yes_ask="0.30", at=later)
+
+        result = scan_baskets(session, max_leg_age=dt.timedelta(seconds=2))
+        assert result.confirmations_available is True
+        assert len(result.observations) == 1
+
+    def test_a_leg_the_cycle_did_not_confirm_stays_stale(self, session: Session) -> None:
+        """A cycle that failed to poll a leg confirms nothing about it. Crediting
+        every leg of the event would turn one live market into an alibi for five
+        dead ones."""
+        snap(session, "L0", yes_ask="0.30", at=T0)
+        snap(session, "L1", yes_ask="0.30", at=T0)
+        later = T0 + dt.timedelta(minutes=5)
+        confirm(session, ("L0", "L2"), at=later - dt.timedelta(seconds=1))
+        snap(session, "L2", yes_ask="0.30", at=later)
+
+        assert scan_baskets(session, max_leg_age=dt.timedelta(seconds=2)).observations == []
+
+    def test_a_later_confirmation_does_not_reach_backwards(self, session: Session) -> None:
+        """Replay must not read a confirmation from the evaluation's future.
+        Otherwise every historical moment looks as fresh as the run's last poll,
+        and the staleness gate stops existing."""
+        snap(session, "L0", yes_ask="0.30", at=T0)
+        snap(session, "L1", yes_ask="0.30", at=T0)
+        later = T0 + dt.timedelta(minutes=5)
+        snap(session, "L2", yes_ask="0.30", at=later)
+        confirm(session, ("L0", "L1", "L2"), at=later + dt.timedelta(minutes=10))
+
+        assert scan_baskets(session, max_leg_age=dt.timedelta(seconds=2)).observations == []
+
+    def test_the_report_says_which_measure_it_used(self, session: Session) -> None:
+        full_set(session, ["0.30", "0.30", "0.30"])
+        assert "last CHANGE" in scan_baskets(session).render()
+
+        confirm(session, ("L0", "L1", "L2"), at=T0)
+        assert "confirmed the leg" in scan_baskets(session).render()
 
 
 class TestCapacity:

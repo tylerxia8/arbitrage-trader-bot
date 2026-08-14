@@ -48,7 +48,7 @@ from decimal import Decimal
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from arbbot.analysis.baskets import event_of
+from arbbot.analysis.baskets import ConfirmationIndex, event_of
 from arbbot.db.models import BookSnapshot
 from arbbot.detector import BasketRequest, evaluate_basket
 from arbbot.fees import KALSHI_SCHEDULE, FeeSchedule
@@ -103,6 +103,15 @@ class FalsificationReport:
     research_mode: bool = True
     window: tuple[dt.datetime | None, dt.datetime | None] = (None, None)
 
+    confirmations_available: bool = False
+    """Whether the archive records which markets each poll cycle confirmed.
+
+    Decisive for reading the staleness column. Without it, quote age is
+    measured from the last time a book *changed*, so a market that sat quiet
+    under a live poller reads as minutes stale -- which is how this report's
+    first verdict came to blame latency for what was a measurement artefact.
+    """
+
     def render(self) -> str:
         lines: list[str] = []
         start, end = self.window
@@ -112,6 +121,13 @@ class FalsificationReport:
             lines.append(f"                   {span.total_seconds() / 86400:.2f} days")
         lines.append(f"snapshots read   : {self.snapshots_read:,}")
         lines.append(f"events           : {self.events_seen}")
+        if self.confirmations_available:
+            lines.append("quote age from   : last poll that confirmed the leg")
+        else:
+            lines.append("quote age from   : last CHANGE -- no poll-cycle record in this window.")
+            lines.append("                   A book confirmed every second but unchanged for ten")
+            lines.append("                   minutes reads as ten minutes stale. Any staleness")
+            lines.append("                   figure below is an upper bound, badly so.")
 
         if self.research_mode:
             lines.append("")
@@ -225,6 +241,8 @@ def run_falsification(
         window=(rows[0][1], rows[-1][1]) if rows else (None, None),
     )
     shadow_config = shadow or ShadowConfig()
+    confirmations = ConfirmationIndex(session)
+    report.confirmations_available = bool(confirmations)
 
     for threshold in staleness_thresholds:
         slice_ = StalenessSlice(max_age=threshold)
@@ -249,7 +267,16 @@ def run_falsification(
                 continue
 
             books = {leg: latest[leg][0] for leg in legs}
-            ages = {leg: captured - latest[leg][1] for leg in legs}
+            # Measured from the last poll that *confirmed* each leg, not the
+            # last one that changed it. The archive stores a snapshot only on
+            # change, so a book quoted flat for ten minutes has a ten-minute-old
+            # row and, under a live poller, a one-second-old observation.
+            # Charging it the ten minutes is what produced this report's
+            # original headline finding, and that finding was an artefact.
+            ages = {
+                leg: captured - confirmations.last_confirmed(leg, captured, default=latest[leg][1])
+                for leg in legs
+            }
 
             evaluation = evaluate_basket(
                 BasketRequest(

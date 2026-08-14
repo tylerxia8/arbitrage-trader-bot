@@ -17,7 +17,7 @@ from sqlalchemy import JSON, BigInteger, DateTime, Integer, MetaData, Numeric, S
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, mapped_column, registry
 
-__all__ = ["Base", "BigIntPk", "Json", "Money", "Sha256", "Timestamp"]
+__all__ = ["Base", "BigIntPk", "Json", "JsonList", "Money", "Sha256", "Timestamp"]
 
 NAMING_CONVENTION = {
     "ix": "ix_%(column_0_label)s",
@@ -41,6 +41,11 @@ Sha256 = Annotated[str, mapped_column(String(64))]
 
 #: JSONB on PostgreSQL, plain JSON on SQLite fixtures.
 Json = Annotated[dict[str, Any], mapped_column(JSON().with_variant(JSONB, "postgresql"))]
+
+#: The same column type for a JSON *array*. Separate from :data:`Json` so the
+#: type checker knows the difference: a list column annotated as a dict silently
+#: makes every membership and equality check against it a no-op.
+JsonList = Annotated[list[str], mapped_column(JSON().with_variant(JSONB, "postgresql"))]
 
 #: Auto-incrementing 64-bit surrogate key for high-volume append-only tables.
 #:

@@ -30,6 +30,7 @@ it cannot prove completeness. Only the approved registry will.
 from __future__ import annotations
 
 import datetime as dt
+from bisect import bisect_right
 from collections import defaultdict
 from dataclasses import dataclass, field
 from decimal import Decimal
@@ -38,7 +39,7 @@ from typing import Final
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from arbbot.db.models import BookSnapshot
+from arbbot.db.models import BookSnapshot, PollCycle
 from arbbot.fees import KALSHI_SCHEDULE, FeeSchedule
 from arbbot.money import PAYOUT_DOLLARS, ZERO
 
@@ -47,6 +48,7 @@ __all__ = [
     "MIN_LEGS",
     "BasketEpisode",
     "BasketObservation",
+    "ConfirmationIndex",
     "ScanResult",
     "event_of",
     "scan_baskets",
@@ -72,6 +74,51 @@ MIN_LEGS: Final = 2
 def event_of(ticker: str) -> str:
     """``KXHIGHTATL-26AUG13-T92`` -> ``KXHIGHTATL-26AUG13``."""
     return ticker.rsplit("-", 1)[0]
+
+
+class ConfirmationIndex:
+    """When each market was last *observed*, as opposed to last *changed*.
+
+    The archive stores a snapshot only when a book moves, so a leg quoted at
+    the same price for ten minutes has a ten-minute-old snapshot and a
+    one-second-old observation. Charging it for the ten minutes is the
+    difference between "this edge was gone before we could reach it" and "this
+    edge sat there and we mismeasured it", which is the entire question the
+    collection run exists to answer.
+
+    Falls back to the snapshot's own time when no cycle covers the market. That
+    is the old, pessimistic behaviour, and it is the right fallback: archives
+    predating :class:`~arbbot.db.models.PollCycle` genuinely cannot prove a
+    quiet book was being watched, and inventing a confirmation for them would
+    retroactively manufacture freshness that was never recorded.
+    """
+
+    def __init__(self, session: Session, *, since: dt.datetime | None = None) -> None:
+        stmt = select(PollCycle.completed_ts, PollCycle.confirmed).order_by(PollCycle.completed_ts)
+        if since is not None:
+            stmt = stmt.where(PollCycle.completed_ts >= since)
+
+        self._times: dict[str, list[dt.datetime]] = defaultdict(list)
+        for completed, confirmed in session.execute(stmt):
+            for ticker in confirmed or ():
+                self._times[ticker].append(completed)
+
+    def __bool__(self) -> bool:
+        return bool(self._times)
+
+    def last_confirmed(self, ticker: str, at: dt.datetime, *, default: dt.datetime) -> dt.datetime:
+        """The most recent confirmation of ``ticker`` at or before ``at``.
+
+        Never later than ``at``: a confirmation from the evaluation's future
+        would make a book look fresher than anything could have known it to be.
+        """
+        times = self._times.get(ticker)
+        if not times:
+            return default
+        index = bisect_right(times, at)
+        if index == 0:
+            return default
+        return max(times[index - 1], default)
 
 
 def _best_yes_ask(no_levels: dict[str, str]) -> tuple[Decimal, Decimal] | None:
@@ -188,6 +235,15 @@ class ScanResult:
     skipped_incomplete: int = 0
     events_seen: int = 0
 
+    confirmations_available: bool = False
+    """Whether the archive records which markets each poll cycle confirmed.
+
+    Without it, staleness is measured from the last time a book *moved*, which
+    charges a quiet market for its quiet and inflates the stale count badly --
+    so the report must say which of the two it is doing rather than present
+    both as the same number.
+    """
+
     @property
     def best(self) -> BasketEpisode | None:
         """Largest net dollars, not the lowest price.
@@ -238,6 +294,12 @@ class ScanResult:
             f"events observed           : {self.events_seen}",
             f"episodes below payout     : {len(self.episodes):,}",
         ]
+        if self.confirmations_available:
+            lines.append("quote age measured from   : last poll that confirmed the leg")
+        else:
+            lines.append("quote age measured from   : last CHANGE (no poll-cycle record)")
+            lines.append("  -- a book unchanged for ten minutes reads as ten minutes stale")
+            lines.append("  -- even if a poller was confirming it every second. Overstated.")
         if not self.episodes:
             lines.append("")
             lines.append("nothing priced below its payout.")
@@ -324,7 +386,9 @@ def scan_baskets(
     for ticker, *_ in rows:
         legs_by_event[event_of(ticker)].add(ticker)
 
-    result = ScanResult(events_seen=len(legs_by_event))
+    confirmations = ConfirmationIndex(session, since=since)
+
+    result = ScanResult(events_seen=len(legs_by_event), confirmations_available=bool(confirmations))
     latest: dict[str, tuple[Decimal, Decimal, dt.datetime]] = {}
     open_episodes: dict[str, BasketEpisode] = {}
 
@@ -348,7 +412,14 @@ def scan_baskets(
             continue
 
         quotes = [latest[leg] for leg in legs]
-        if any(captured - when > max_leg_age for _, _, when in quotes):
+        # Age is measured from the last time the poller *saw* each leg, not the
+        # last time it moved. A book unchanged for ten minutes but confirmed a
+        # second ago is a one-second-old quote.
+        if any(
+            captured - confirmations.last_confirmed(leg, captured, default=latest[leg][2])
+            > max_leg_age
+            for leg in legs
+        ):
             result.skipped_stale += 1
             continue
 

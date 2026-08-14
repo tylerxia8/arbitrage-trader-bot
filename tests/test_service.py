@@ -18,7 +18,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from arbbot.collection.service import CollectionService
 from arbbot.db.base import Base
-from arbbot.db.models import FeedHealth, RawMessage
+from arbbot.db.models import FeedHealth, PollCycle, RawMessage
 from arbbot.venues.kalshi.rest import KalshiRestClient
 
 T0 = dt.datetime(2026, 8, 12, 12, 0, tzinfo=dt.UTC)
@@ -188,6 +188,70 @@ class TestHealthSampling:
             sample = session.execute(select(FeedHealth)).scalar_one()
         assert sample.is_healthy is False
         assert sample.parse_errors == 1
+
+
+class TestPollCycleRecord:
+    """Every cycle records which markets it confirmed.
+
+    Without this, ``book_snapshot`` is the only evidence a market was watched,
+    and it is written only when the book *changes* -- so a quiet market is
+    indistinguishable from an unwatched one, and any freshness measurement
+    charges it for its quiet.
+    """
+
+    async def test_a_cycle_records_what_it_confirmed(self, factory: sessionmaker[Session]) -> None:
+        service = service_over(factory, lambda r: httpx.Response(200, json=GOOD), ["AAA", "BBB"])
+        await service.run_cycle(now=T0)
+
+        with factory() as session:
+            cycle = session.execute(select(PollCycle)).scalar_one()
+        assert sorted(cycle.confirmed) == ["AAA", "BBB"]
+        assert cycle.failed == []
+
+    async def test_an_unchanged_poll_still_confirms(self, factory: sessionmaker[Session]) -> None:
+        """The row this whole table exists for. An unchanged poll is the only
+        evidence that a book which has not moved in ten minutes is current."""
+        service = service_over(factory, lambda r: httpx.Response(200, json=GOOD), ["AAA"])
+        await service.run_cycle(now=T0)
+        report = await service.run_cycle(now=T0 + dt.timedelta(seconds=30))
+
+        assert report.unchanged == 1
+        with factory() as session:
+            cycles = list(session.execute(select(PollCycle).order_by(PollCycle.id)).scalars())
+        assert [c.confirmed for c in cycles] == [["AAA"], ["AAA"]]
+
+    async def test_a_failed_poll_confirms_nothing(self, factory: sessionmaker[Session]) -> None:
+        """Recorded as failed rather than simply omitted: a silent absence from
+        ``confirmed`` would be indistinguishable from a market that was not in
+        the universe yet."""
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return (
+                httpx.Response(404)
+                if "BROKEN" in request.url.path
+                else httpx.Response(200, json=GOOD)
+            )
+
+        service = service_over(factory, handler, ["AAA", "BROKEN"])
+        await service.run_cycle(now=T0)
+
+        with factory() as session:
+            cycle = session.execute(select(PollCycle)).scalar_one()
+        assert cycle.confirmed == ["AAA"]
+        assert cycle.failed == ["BROKEN"]
+
+    async def test_the_cycle_is_stamped_when_it_finished(
+        self, factory: sessionmaker[Session]
+    ) -> None:
+        """A leg polled at the close of a slow cycle was confirmed then.
+        Crediting it with the cycle's start time overstates its freshness --
+        the direction that invents edge."""
+        service = service_over(factory, lambda r: httpx.Response(200, json=GOOD), ["AAA"])
+        await service.run_cycle(now=T0)
+
+        with factory() as session:
+            cycle = session.execute(select(PollCycle)).scalar_one()
+        assert cycle.completed_ts >= cycle.started_ts
 
 
 class TestProbeIsolation:
