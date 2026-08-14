@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import datetime as dt
+from decimal import Decimal
 from typing import Any
 
 import httpx
@@ -18,10 +19,14 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from arbbot.collection.service import CollectionService
 from arbbot.db.base import Base
-from arbbot.db.models import FeedHealth, PollCycle, RawMessage
+from arbbot.db.models import Evaluation, FeedHealth, PollCycle, RawMessage
+from arbbot.registry import RelationshipRegistry
+from arbbot.relationships import RelationshipType
 from arbbot.venues.kalshi.rest import KalshiRestClient
 
 T0 = dt.datetime(2026, 8, 12, 12, 0, tzinfo=dt.UTC)
+
+D = Decimal
 
 GOOD = {"orderbook_fp": {"yes_dollars": [["0.5900", "10.00"]], "no_dollars": [["0.4000", "5.00"]]}}
 
@@ -188,6 +193,87 @@ class TestHealthSampling:
             sample = session.execute(select(FeedHealth)).scalar_one()
         assert sample.is_healthy is False
         assert sample.parse_errors == 1
+
+
+class TestLiveDetection:
+    """Detection runs inside the cycle that produced the books.
+
+    Moved outside, it would price whatever the books happened to hold whenever
+    it next ran, which is replay wearing a live system's clothes.
+    """
+
+    async def test_no_detector_writes_no_evaluations(self, factory: sessionmaker[Session]) -> None:
+        """Collection stays useful as pure collection. A run gathering evidence
+        before any relationship exists has nothing to price."""
+        service = service_over(factory, lambda r: httpx.Response(200, json=GOOD), ["AAA"])
+        report = await service.run_cycle(now=T0)
+
+        assert report.detection is None
+        assert count(factory, Evaluation) == 0
+
+    async def test_a_detector_prices_the_cycle_it_belongs_to(
+        self, factory: sessionmaker[Session]
+    ) -> None:
+        from arbbot.detector.live import LiveDetector
+
+        with factory() as session:
+            registry = RelationshipRegistry(session)
+            record = registry.draft(
+                slug="kalshi:PAIR",
+                relationship_type=RelationshipType.INTERVAL_PARTITION,
+                legs=[{"ticker": t} for t in ("AAA", "BBB")],
+                payout_proof={"claim": "exactly one settles YES"},
+                dependency_hashes={"AAA": "h" * 64, "BBB": "h" * 64},
+            )
+            registry.approve(record, reviewer="tester", evidence="read the terms")
+            session.commit()
+
+        service = service_over(
+            factory,
+            lambda r: httpx.Response(200, json=GOOD),
+            ["AAA", "BBB"],
+            detector=LiveDetector(quantity=D("1")),
+        )
+        report = await service.run_cycle(now=T0)
+
+        assert report.detection is not None
+        assert report.detection.priced == 1
+        assert count(factory, Evaluation) == 1
+
+    async def test_a_failed_leg_leaves_its_basket_unpriced(
+        self, factory: sessionmaker[Session]
+    ) -> None:
+        """A cycle that could not poll a leg confirms nothing about it, and
+        guessing an age would defeat the freshness gate."""
+        from arbbot.detector.live import LiveDetector
+
+        with factory() as session:
+            registry = RelationshipRegistry(session)
+            record = registry.draft(
+                slug="kalshi:PAIR",
+                relationship_type=RelationshipType.INTERVAL_PARTITION,
+                legs=[{"ticker": t} for t in ("AAA", "BROKEN")],
+                payout_proof={"claim": "exactly one settles YES"},
+                dependency_hashes={"AAA": "h" * 64, "BROKEN": "h" * 64},
+            )
+            registry.approve(record, reviewer="tester", evidence="read the terms")
+            session.commit()
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return (
+                httpx.Response(404)
+                if "BROKEN" in request.url.path
+                else httpx.Response(200, json=GOOD)
+            )
+
+        service = service_over(
+            factory, handler, ["AAA", "BROKEN"], detector=LiveDetector(quantity=D("1"))
+        )
+        report = await service.run_cycle(now=T0)
+
+        assert report.detection is not None
+        assert report.detection.priced == 0
+        assert report.detection.skipped_incomplete == 1
 
 
 class TestPollCycleRecord:

@@ -47,6 +47,7 @@ from arbbot.collection.collector import (
 )
 from arbbot.collection.health import utc_now
 from arbbot.db.models import PollCycle
+from arbbot.detector.live import DetectionReport, LiveDetector
 from arbbot.venues.kalshi import KalshiAdapter
 from arbbot.venues.kalshi.rest import KalshiRestClient
 
@@ -100,6 +101,8 @@ class CycleReport:
     failed: int = 0
     errors: list[str] = field(default_factory=list)
     refresh: RefreshReport | None = None
+    detection: DetectionReport | None = None
+    """What the live detector decided this cycle, when one is attached."""
 
     @property
     def polled(self) -> int:
@@ -128,6 +131,7 @@ class CollectionService:
         refresh_interval_seconds: float = 900.0,
         progress_interval_seconds: float = 600.0,
         channel: str = CHANNEL,
+        detector: LiveDetector | None = None,
     ) -> None:
         """
         :param market_source: called periodically to re-resolve the live
@@ -154,6 +158,11 @@ class CollectionService:
         adapter = adapter or KalshiAdapter()
         self._adapter = adapter
         self._channel = channel
+        # Optional so the collector stays useful as pure collection. A run
+        # gathering evidence before any relationship exists has nothing to
+        # price, and attaching a detector to it would write a row per cycle
+        # saying so.
+        self._detector = detector
         # One poll may not outlast the cycle it belongs to. Otherwise a single
         # broken market holds the whole cycle open through the client's backoff
         # ladder, and every other market's sampling cadence slips with it.
@@ -251,6 +260,24 @@ class CollectionService:
                             report.errors.append(f"{result.ticker}: {result.error}")
 
             completed = now or utc_now()
+
+            if self._detector is not None and confirmed:
+                # Priced inside the cycle's own transaction, against the books
+                # the cycle just built, with ages measured from this cycle's
+                # completion. Detection moved outside would price whatever the
+                # books happened to hold whenever it next ran, which is replay
+                # wearing a live system's clothes.
+                report.detection = self._detector.evaluate_cycle(
+                    session,
+                    books={
+                        c.ticker: c.reconstructor.book
+                        for c in self.collectors
+                        if c.ticker in set(confirmed)
+                    },
+                    confirmed_ts=dict.fromkeys(confirmed, completed),
+                    now=completed,
+                )
+
             session.add(
                 PollCycle(
                     venue=self._adapter.venue,

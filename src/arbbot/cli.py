@@ -113,13 +113,16 @@ def _doctor() -> int:
     return 0 if ok else 1
 
 
-def _collect(tickers: list[str], poll_interval: float, use_universe: bool) -> int:
+def _collect(
+    tickers: list[str], poll_interval: float, use_universe: bool, *, detect: bool = False
+) -> int:
     """Run the polling collector until interrupted."""
     import asyncio
     import logging
 
     from arbbot.collection.service import CollectionService
     from arbbot.db.session import session_factory
+    from arbbot.detector.live import LiveDetector
     from arbbot.venues.kalshi.rest import KalshiRestClient
     from arbbot.venues.kalshi.universe import UniverseResolver
 
@@ -162,6 +165,7 @@ def _collect(tickers: list[str], poll_interval: float, use_universe: bool) -> in
                 tickers=[] if use_universe else tickers,
                 poll_interval_seconds=poll_interval,
                 market_source=resolver.resolve if use_universe else None,
+                detector=LiveDetector() if detect else None,
             )
             if use_universe:
                 refresh = await service.refresh_markets()
@@ -806,6 +810,13 @@ def main(argv: list[str] | None = None) -> int:
         "as markets rotate, instead of using a fixed ticker list",
     )
     collect.add_argument(
+        "--detect",
+        action="store_true",
+        help="price every registered relationship each cycle and persist the decision, "
+        "accepted or rejected. Nothing is traded: an evaluation is only marked tradeable "
+        "when an approved relationship covers it, and no execution path exists.",
+    )
+    collect.add_argument(
         "--interval",
         type=float,
         default=5.0,
@@ -841,7 +852,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "collect":
         if not args.tickers and not args.universe:
             parser.error("give tickers or --universe")
-        return _collect(args.tickers, args.interval, args.universe)
+        return _collect(args.tickers, args.interval, args.universe, detect=args.detect)
     parser.error(f"unknown command {args.command!r}")  # pragma: no cover -- NoReturn
 
 

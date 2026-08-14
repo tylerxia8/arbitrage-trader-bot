@@ -465,8 +465,27 @@ class Evaluation(Base):
     relationship_version: Mapped[int] = mapped_column(Integer)
 
     accepted: Mapped[bool] = mapped_column(Boolean, default=False)
+    """Whether the **economics** cleared: depth, freshness, fees, net edge.
+
+    Deliberately not the same question as "may this be traded". Recording only
+    tradeability would make every row read ``relationship_not_approved`` until
+    a reviewer signs, and the archive would learn nothing about whether an edge
+    existed in the meantime. Recording only economics would suggest a
+    tradeable opportunity that nobody has signed for. Both are stored.
+    """
+
+    tradeable: Mapped[bool] = mapped_column(Boolean, default=False)
+    """Whether it cleared *and* an approved relationship covered it.
+
+    The only column an execution path may ever read.
+    """
+
+    relationship_status: Mapped[str] = mapped_column(String(32), default="pending")
+    """Registry status at decision time, so a later approval cannot make a past
+    rejection look like it had been tradeable all along."""
+
     reason: Mapped[str | None] = mapped_column(String(64))
-    """Rejection reason code, from the closed catalog. NULL when accepted."""
+    """Economic rejection reason, from the closed catalog. NULL when accepted."""
 
     detail: Mapped[str | None] = mapped_column(Text)
 
@@ -477,8 +496,13 @@ class Evaluation(Base):
     guaranteed_payout: Mapped[Money]
     net_edge: Mapped[Money]
 
-    legs: Mapped[Json]
-    """Per-leg quotes and depth walks, so the decision reproduces exactly."""
+    legs: Mapped[JsonRows]
+    """Per-leg quotes and depth walks, so the decision reproduces exactly.
+
+    An array of objects, typed as one. Annotating it as a mapping made every
+    index and membership check against it silently meaningless -- the same slip
+    that hid in ``RelationshipRecord.legs``.
+    """
 
     fee_rule: Mapped[str] = mapped_column(String(64))
     parser_version: Mapped[str] = mapped_column(String(32))
