@@ -40,7 +40,7 @@ from arbbot.money import ZERO
 from arbbot.risk import ExposureSnapshot, OpenIntent
 from arbbot.states import OrderState, assert_transition, is_exposed
 
-__all__ = ["ExecutionStore"]
+__all__ = ["ExecutionStore", "StoreJournal"]
 
 
 class ExecutionStore:
@@ -209,6 +209,10 @@ class ExecutionStore:
             )
         return ExposureSnapshot(intents=intents, realised_loss_today=realised_loss_today)
 
+    def journal(self, *, relationship_slug: str = "") -> StoreJournal:
+        """An adapter that lets the executor write through this store."""
+        return StoreJournal(self, relationship_slug=relationship_slug)
+
     def awaiting_human(self) -> list[OrderIntent]:
         """Intents parked waiting for a person to approve or decline them."""
         return list(
@@ -235,3 +239,62 @@ class ExecutionStore:
             if net < ZERO:
                 loss += -net
         return loss
+
+
+class StoreJournal:
+    """Writes an executor's progress through an :class:`ExecutionStore`.
+
+    Exists because an intent can reach the executor by two routes. The loop
+    parks one in ``AWAITING_HUMAN`` and a person approves it, in which case the
+    row is already there; or an intent is executed directly, in which case it
+    is not. A journal that always created a row would collide with the loop's,
+    and one that never did would have nothing to attach legs to.
+
+    So ``opened`` walks whatever exists to ``SUBMITTING`` and creates it first
+    only when it must.
+    """
+
+    def __init__(self, store: ExecutionStore, *, relationship_slug: str = "") -> None:
+        self._store = store
+        self._slug = relationship_slug
+
+    def opened(self, intent: BasketIntent) -> None:
+        row = self._store.find(intent.intent_id)
+        if row is None:
+            self._store.open_intent(intent, relationship_slug=self._slug)
+            self._store.transition(intent.intent_id, OrderState.RISK_APPROVED)
+        elif OrderState(row.state) is OrderState.PROPOSED:
+            self._store.transition(intent.intent_id, OrderState.RISK_APPROVED)
+        self._store.transition(intent.intent_id, OrderState.SUBMITTING)
+
+    def leg(self, intent_id: str, request: OrderRequest, result: OrderResult, side: str) -> None:
+        self._store.record_leg(intent_id, request, result, side=side)
+
+    def ended(self, result: ExecutionResult) -> None:
+        row = self._store.find(result.intent_id)
+        if row is None:
+            # A refusal on an intent that was never opened -- the gates ran and
+            # said no before anything was written. There is nothing to record
+            # against, and nothing happened, so nothing is recorded.
+            return
+
+        state = OrderState(row.state)
+        if state is OrderState.AWAITING_HUMAN:
+            # The executor refused a basket that was already parked: a control
+            # that passed when it was proposed no longer does. The machine has
+            # no AWAITING_HUMAN -> RISK_REJECTED edge, and it should not -- what
+            # happened is that the basket stopped being viable while it waited,
+            # which is what EXPIRED means here.
+            self._store.transition(
+                result.intent_id,
+                OrderState.EXPIRED,
+                reason=str(result.reason) if result.reason else None,
+                detail=(
+                    f"no longer viable at approval time: {result.detail}"
+                    if result.detail
+                    else "no longer viable at approval time"
+                ),
+            )
+            return
+
+        self._store.finish(result)

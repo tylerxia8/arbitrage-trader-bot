@@ -446,6 +446,84 @@ def _maker(since_hours: float | None, event: str | None, max_age: float, horizon
     return 0
 
 
+def _intents(action: str, args: argparse.Namespace) -> int:
+    """See and answer the queue of baskets waiting on a person.
+
+    This is FR-016's third gate as something a person can actually operate.
+    The loop parks baskets and the executor refuses anything unapproved; until
+    there was a way to look at the queue and answer it, the design's central
+    control had never been exercised at all.
+    """
+    from arbbot.db.session import session_factory
+    from arbbot.execution import ExecutionStore, OperatorConsole, PaperGateway
+    from arbbot.execution.executor import Executor
+    from arbbot.risk import RiskGate
+
+    try:
+        settings = load_settings()
+    except ValidationError as exc:
+        print("configuration          : INVALID", file=sys.stderr)
+        print(exc, file=sys.stderr)
+        return 2
+
+    factory = session_factory(create_engine_from_settings(settings))
+    with factory() as session:
+        store = ExecutionStore(session)
+        # A paper gateway, because no venue gateway exists yet and one that
+        # silently did nothing would be worse than one that says so.
+        console = OperatorConsole(
+            store,
+            Executor(PaperGateway(), RiskGate(settings.risk), journal=store.journal()),
+        )
+
+        if action == "list":
+            print(console.render_queue())
+            return 0
+
+        if action == "reject":
+            try:
+                console.reject(args.intent_id, reviewer=args.reviewer, reason=args.reason)
+            except Exception as exc:
+                print(f"refused: {exc}", file=sys.stderr)
+                return 1
+            session.commit()
+            print(f"declined {args.intent_id}, recorded against {args.reviewer}")
+            return 0
+
+        if action == "approve":
+            print(
+                "approval from the CLI is not wired to a venue gateway yet.\n"
+                "There is no order path to any venue: the demo gateway needs a\n"
+                "credential and the production one needs its signing scheme\n"
+                "confirmed. Approving here would fill against a paper book and\n"
+                "record it as though it had happened, which is the one thing\n"
+                "this system must not do.",
+                file=sys.stderr,
+            )
+            return 2
+
+    print(f"unknown action {action!r}", file=sys.stderr)
+    return 2
+
+
+def _halt(action: str, args: argparse.Namespace) -> int:
+    """Show, set, or clear the trading halt."""
+    from arbbot.risk import HaltCause, TradingHalt
+
+    halt = TradingHalt()
+    if action == "status":
+        print(halt.state.render())
+        print()
+        print("Note: the halt is in-process and resets when the process does.")
+        print("Nothing persists it yet, because nothing runs long enough to need it.")
+        return 0
+    if action == "stop":
+        print(halt.trip(HaltCause.MANUAL, args.reason).render())
+        return 0
+    print(f"unknown action {action!r}", file=sys.stderr)
+    return 2
+
+
 def _relationships(action: str, args: argparse.Namespace) -> int:
     """Draft, list, and approve logical relationships.
 
@@ -736,6 +814,26 @@ def main(argv: list[str] | None = None) -> int:
         "over more than a couple of minutes is six directional bets, not an arbitrage.",
     )
 
+    intents = subparsers.add_parser(
+        "intents", help="see and answer the baskets waiting on a person (FR-016)"
+    )
+    intent_actions = intents.add_subparsers(dest="action", required=True)
+    intent_actions.add_parser("list", help="show the approval queue and what expires when")
+    approve_intent = intent_actions.add_parser("approve", help="approve and acquire one basket")
+    approve_intent.add_argument("intent_id")
+    approve_intent.add_argument("--reviewer", required=True)
+    approve_intent.add_argument("--evidence", required=True)
+    decline = intent_actions.add_parser("reject", help="decline one basket")
+    decline.add_argument("intent_id")
+    decline.add_argument("--reviewer", required=True)
+    decline.add_argument("--reason", required=True)
+
+    halt = subparsers.add_parser("halt", help="show or set the trading halt")
+    halt_actions = halt.add_subparsers(dest="action", required=True)
+    halt_actions.add_parser("status", help="whether trading is permitted, and why not")
+    stop = halt_actions.add_parser("stop", help="stop trading until a person clears it")
+    stop.add_argument("--reason", required=True)
+
     relationships = subparsers.add_parser(
         "relationships",
         help="draft, list, and approve the logical claims every arbitrage rests on",
@@ -848,6 +946,10 @@ def main(argv: list[str] | None = None) -> int:
         )
     if args.command == "maker":
         return _maker(args.since_hours, args.event, args.max_leg_age, args.horizon)
+    if args.command == "intents":
+        return _intents(args.action, args)
+    if args.command == "halt":
+        return _halt(args.action, args)
     if args.command == "relationships":
         return _relationships(args.action, args)
     if args.command == "probe":

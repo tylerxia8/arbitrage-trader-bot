@@ -16,29 +16,34 @@ from arbbot.execution.gateway import (
     PaperGateway,
 )
 from arbbot.execution.loop import Candidate, LoopReport, TradingLoop
+from arbbot.execution.operator import ApprovalRefused, OperatorConsole, PendingBasket
 from arbbot.execution.reconcile import (
     PositionSource,
     Reconciler,
     ReconciliationReport,
     Verdict,
 )
-from arbbot.execution.store import ExecutionStore
+from arbbot.execution.store import ExecutionStore, StoreJournal
 
 __all__ = [
+    "ApprovalRefused",
     "BasketIntent",
     "Candidate",
     "ExecutionResult",
     "ExecutionStore",
     "Executor",
     "LoopReport",
+    "OperatorConsole",
     "OrderGateway",
     "OrderOutcome",
     "OrderRequest",
     "OrderResult",
     "PaperGateway",
+    "PendingBasket",
     "PositionSource",
     "Reconciler",
     "ReconciliationReport",
+    "StoreJournal",
     "TradingLoop",
     "Verdict",
     "leg_key",
