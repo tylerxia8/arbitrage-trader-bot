@@ -299,6 +299,38 @@ class TestGrouping:
     def test_event_is_the_ticker_without_its_leg(self) -> None:
         assert event_of("KXHIGHTATL-26AUG13-T92") == "KXHIGHTATL-26AUG13"
 
+    def test_a_range_suffix_does_not_split_into_its_own_event(self) -> None:
+        """The bug that would have sunk the tweet-count families.
+
+        "Everything before the last hyphen" is right for every temperature
+        ticker, which carries one suffix segment, and wrong for any market
+        whose suffix is a range. Each range leg became its own event, no basket
+        was ever complete, and the family reported nothing -- from string
+        handling, looking exactly like a finding.
+        """
+        assert event_of("KXFEDTWEETS-26AUG20-12-14") == "KXFEDTWEETS-26AUG20"
+        assert event_of("KXIMFTWEETS-26AUG20-11-15") == "KXIMFTWEETS-26AUG20"
+        assert event_of("KXWEFTWEETS-26AUG20-50-74") == "KXWEFTWEETS-26AUG20"
+
+    def test_range_and_tail_legs_of_one_event_group_together(self) -> None:
+        """The legs of a tweet-count partition mix both shapes, and a grouping
+        that separated them would leave every basket permanently incomplete."""
+        legs = [
+            "KXFEDTWEETS-26AUG20-UN9",
+            "KXFEDTWEETS-26AUG20-9-11",
+            "KXFEDTWEETS-26AUG20-12-14",
+            "KXFEDTWEETS-26AUG20-OV20",
+        ]
+        assert {event_of(leg) for leg in legs} == {"KXFEDTWEETS-26AUG20"}
+
+    def test_other_families_are_unaffected(self) -> None:
+        assert event_of("KXTRUTHSOCIAL-26AUG22-B109") == "KXTRUTHSOCIAL-26AUG22"
+        assert event_of("KXDSENATESEATSH-27-A57") == "KXDSENATESEATSH-27"
+        assert event_of("KXEOTRUMPTERM-29JAN20-300") == "KXEOTRUMPTERM-29JAN20"
+
+    def test_a_ticker_with_no_leg_suffix_is_its_own_event(self) -> None:
+        assert event_of("KXFEDTWEETS-26AUG20") == "KXFEDTWEETS-26AUG20"
+
     def test_separate_events_do_not_mix(self, session: Session) -> None:
         full_set(session, ["0.30", "0.30", "0.30"])
         for leg in ("A", "B"):

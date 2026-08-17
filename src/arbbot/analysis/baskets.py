@@ -72,8 +72,22 @@ MIN_LEGS: Final = 2
 
 
 def event_of(ticker: str) -> str:
-    """``KXHIGHTATL-26AUG13-T92`` -> ``KXHIGHTATL-26AUG13``."""
-    return ticker.rsplit("-", 1)[0]
+    """``KXHIGHTATL-26AUG13-T92`` -> ``KXHIGHTATL-26AUG13``.
+
+    Takes the series and the period, not "everything before the last hyphen".
+    The earlier version did the latter and was correct for every temperature
+    ticker, because those carry exactly one suffix segment. It is wrong for any
+    market whose suffix is a *range*: ``KXFEDTWEETS-26AUG20-12-14`` became
+    ``KXFEDTWEETS-26AUG20-12``, so each range leg was filed as its own event,
+    no basket ever had a complete leg set, and the family reported nothing.
+
+    That mattered a great deal. The three families with the widest apparent
+    maker discount on this venue -- the tweet-count markets -- are all
+    range-suffixed, so the bug would have produced "no opportunities here" from
+    string handling and looked exactly like a finding.
+    """
+    parts = ticker.split("-")
+    return "-".join(parts[:2]) if len(parts) > 2 else ticker
 
 
 class ConfirmationIndex:
