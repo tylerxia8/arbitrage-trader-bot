@@ -18,6 +18,8 @@ from __future__ import annotations
 
 import asyncio
 import datetime as dt
+import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from types import TracebackType
 from typing import Any, Final, Self
@@ -55,6 +57,21 @@ _MAX_ATTEMPTS: Final = 6
 #: patience converts a refusal into a response -- it only lengthens the
 #: refusal. Three in a row is already unambiguous.
 _FAILURE_THRESHOLD: Final = 3
+
+#: How long an open circuit waits before letting a single request through.
+#:
+#: The first version of this breaker had no such wait and never closed at all.
+#: It protected the address exactly as intended -- and then a transient blip
+#: tripped it, the venue recovered minutes later, and the collector spent sixty
+#: hours refusing to try. A breaker that cannot close is not a safety device,
+#: it is a single point of failure with good intentions.
+#:
+#: So: wait, then allow exactly one probe. A successful probe closes the
+#: circuit; a failed one doubles the wait. That keeps the property worth having
+#: -- a refusing venue is never hammered -- without turning every hiccup into
+#: an outage that needs a human to notice.
+_BREAKER_COOLDOWN_SECONDS: Final = 60.0
+_BREAKER_COOLDOWN_MAX_SECONDS: Final = 900.0
 
 
 class VenueUnreachable(RuntimeError):
@@ -118,6 +135,7 @@ class KalshiRestClient:
         max_attempts: int = _MAX_ATTEMPTS,
         failure_threshold: int = _FAILURE_THRESHOLD,
         client: httpx.AsyncClient | None = None,
+        clock: Callable[[], float] | None = None,
     ) -> None:
         """
         :param max_attempts: how many times to try a request before giving up.
@@ -142,7 +160,10 @@ class KalshiRestClient:
         self.max_attempts = max_attempts
         self.failure_threshold = failure_threshold
         self._consecutive_transport_failures = 0
-        self._tripped = False
+        self._tripped_at: float | None = None
+        self._cooldown = _BREAKER_COOLDOWN_SECONDS
+        self._probing = False
+        self._clock = clock or time.monotonic
         self._limiter = RateLimiter(requests_per_second)
         self._owns_client = client is None
         self._client = client or httpx.AsyncClient(
@@ -236,13 +257,19 @@ class KalshiRestClient:
         url = f"{self.base_url}{path}"
         delay = _BACKOFF_BASE_SECONDS
 
-        if self._tripped:
-            raise VenueUnreachable(
-                f"circuit open after {self._consecutive_transport_failures} consecutive "
-                f"transport failures at {self.base_url}. Not retrying: when a venue stops "
-                f"completing TLS handshakes it is refusing this address, and continuing to "
-                f"knock is what turns a short refusal into a long one. Diagnose before reopening."
-            )
+        if self._tripped_at is not None:
+            waited = self._clock() - self._tripped_at
+            if waited < self._cooldown:
+                raise VenueUnreachable(
+                    f"circuit open at {self.base_url} after "
+                    f"{self._consecutive_transport_failures} consecutive transport failures. "
+                    f"A venue that stops completing TLS handshakes is refusing this address, "
+                    f"and continuing to knock lengthens the refusal. Next probe in "
+                    f"{self._cooldown - waited:.0f}s."
+                )
+            # Half open: exactly one request goes through. Success closes the
+            # circuit; failure doubles the wait before the next probe.
+            self._probing = True
 
         for attempt in range(1, self.max_attempts + 1):
             await self._limiter.acquire()
@@ -254,15 +281,27 @@ class KalshiRestClient:
                 # 2026-08-14 that was the venue blocking this address while the
                 # collector patiently retried for fifteen hours.
                 self._consecutive_transport_failures += 1
-                if self._consecutive_transport_failures >= self.failure_threshold:
-                    self._tripped = True
+                if self._probing:
+                    # The probe failed: still refused. Wait longer rather than
+                    # settling into a fixed rhythm of knocking.
+                    self._cooldown = min(self._cooldown * 2, _BREAKER_COOLDOWN_MAX_SECONDS)
+                    self._tripped_at = self._clock()
+                    self._probing = False
+                elif self._consecutive_transport_failures >= self.failure_threshold:
+                    self._tripped_at = self._clock()
                 if attempt == self.max_attempts:
                     raise
                 await asyncio.sleep(delay)
                 delay = min(delay * 2, _BACKOFF_MAX_SECONDS)
                 continue
             else:
+                # Any answer at all -- a 404 included -- means the venue is
+                # talking to this address again, which is the only thing this
+                # breaker was ever measuring.
                 self._consecutive_transport_failures = 0
+                self._tripped_at = None
+                self._cooldown = _BREAKER_COOLDOWN_SECONDS
+                self._probing = False
 
             # The venue publishes no Retry-After; the bucket refills
             # continuously, so exponential backoff is the documented remedy.

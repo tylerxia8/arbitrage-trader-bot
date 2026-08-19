@@ -238,7 +238,7 @@ class TestCircuitBreaker:
         with pytest.raises(httpx.TransportError):
             await client.fetch_orderbook("KXTEST-1")
 
-        assert client._tripped is False
+        assert client._tripped_at is None
 
     async def test_an_http_error_does_not_open_the_circuit(self) -> None:
         """A 404 is the venue answering. Only a transport failure is a refusal
@@ -249,7 +249,7 @@ class TestCircuitBreaker:
             with pytest.raises(httpx.HTTPStatusError):
                 await client.fetch_orderbook("KXTEST-1")
 
-        assert client._tripped is False
+        assert client._tripped_at is None
 
 
 class TestPagination:
@@ -330,3 +330,113 @@ class TestDefaults:
     def test_trailing_slash_is_normalised(self) -> None:
         client = KalshiRestClient(base_url="https://example.test/v2/")
         assert client.base_url == "https://example.test/v2"
+
+
+class TestBreakerRecovery:
+    """A breaker that cannot close is a single point of failure.
+
+    The first version had no cooldown and no way back. It protected the address
+    exactly as designed, and then a transient blip tripped it, the venue
+    recovered minutes later, and a collection run spent sixty hours refusing to
+    make a request. These pin the way out.
+    """
+
+    async def test_the_circuit_stays_open_during_the_cooldown(self) -> None:
+        now = [0.0]
+        client = client_with(
+            lambda r: (_ for _ in ()).throw(httpx.ConnectError("reset")),
+            max_attempts=1,
+            failure_threshold=1,
+            clock=lambda: now[0],
+        )
+        with pytest.raises(httpx.TransportError):
+            await client.fetch_orderbook("A")
+
+        now[0] = 30.0
+        with pytest.raises(VenueUnreachable, match="Next probe in"):
+            await client.fetch_orderbook("A")
+
+    async def test_one_probe_is_allowed_after_the_cooldown(self) -> None:
+        now = [0.0]
+        calls = 0
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise httpx.ConnectError("reset")
+            return httpx.Response(200, json={"orderbook": {}})
+
+        client = client_with(handler, max_attempts=1, failure_threshold=1, clock=lambda: now[0])
+        with pytest.raises(httpx.TransportError):
+            await client.fetch_orderbook("A")
+
+        now[0] = 61.0
+        await client.fetch_orderbook("A")
+        assert calls == 2
+
+    async def test_a_successful_probe_closes_the_circuit(self) -> None:
+        """The property that was missing. Recovery must not need a human."""
+        now = [0.0]
+        calls = 0
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise httpx.ConnectError("reset")
+            return httpx.Response(200, json={"orderbook": {}})
+
+        client = client_with(handler, max_attempts=1, failure_threshold=1, clock=lambda: now[0])
+        with pytest.raises(httpx.TransportError):
+            await client.fetch_orderbook("A")
+        now[0] = 61.0
+        await client.fetch_orderbook("A")
+
+        # Immediately afterwards, with no further waiting.
+        await client.fetch_orderbook("A")
+        assert client._tripped_at is None
+
+    async def test_a_failed_probe_doubles_the_wait(self) -> None:
+        """Otherwise an open circuit settles into a fixed rhythm of knocking,
+        which is the behaviour the breaker exists to prevent."""
+        now = [0.0]
+        client = client_with(
+            lambda r: (_ for _ in ()).throw(httpx.ConnectError("reset")),
+            max_attempts=1,
+            failure_threshold=1,
+            clock=lambda: now[0],
+        )
+        with pytest.raises(httpx.TransportError):
+            await client.fetch_orderbook("A")
+
+        now[0] = 61.0
+        with pytest.raises(httpx.TransportError):
+            await client.fetch_orderbook("A")
+
+        now[0] = 100.0
+        with pytest.raises(VenueUnreachable):
+            await client.fetch_orderbook("A")
+        assert client._cooldown == 120.0
+
+    async def test_an_http_answer_also_closes_it(self) -> None:
+        """A 404 is the venue talking to this address, which is the only thing
+        the breaker was measuring."""
+        now = [0.0]
+        calls = 0
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise httpx.ConnectError("reset")
+            return httpx.Response(404)
+
+        client = client_with(handler, max_attempts=1, failure_threshold=1, clock=lambda: now[0])
+        with pytest.raises(httpx.TransportError):
+            await client.fetch_orderbook("A")
+        now[0] = 61.0
+        with pytest.raises(httpx.HTTPStatusError):
+            await client.fetch_orderbook("A")
+
+        assert client._tripped_at is None
