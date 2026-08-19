@@ -56,23 +56,44 @@ class TestPartitions:
         assert "human review" in classify_event(event(), partition_markets()).reason
 
 
-class TestTheEnumeratedTrap:
-    def test_named_candidates_are_not_a_partition(self) -> None:
-        """The failure this module exists to prevent. Sixteen listed 2028
-        matchups priced at $0.746 in a live survey -- an apparent 25% edge
-        that is really the market pricing the outcomes nobody listed."""
+class TestCategoricalOutcomes:
+    """Named outcomes are a question, not an answer.
+
+    This class previously asserted that named outcomes are never collectively
+    exhaustive and must be dismissed. That is true of "who will be the
+    nominee", where the field of people is open, and false of "cut / hold /
+    hike", where the taxonomy is closed -- and the venue describes both
+    identically, as ``custom`` strike types on an exclusive event.
+
+    Dismissing the class cost a real opportunity: a five-outcome Fed decision
+    basket at ninety cents for a guaranteed dollar, five hundred contracts
+    deep, skipped by a venue-wide sweep because it looked like a candidate
+    list. So the machine now routes the question to the reviewer instead of
+    guessing the answer.
+    """
+
+    def test_named_outcomes_are_classified_categorical(self) -> None:
         legs = [market(f"C{i}", "custom") for i in range(16)]
         result = classify_event(event(), legs)
 
-        assert result.verdict is StructuralVerdict.ENUMERATED
-        assert not result.may_propose
-        assert "exhaustive" in result.reason
+        assert result.verdict is StructuralVerdict.CATEGORICAL
+        assert "cannot be read from the payload" in result.reason
 
-    def test_exclusivity_alone_does_not_make_a_basket(self) -> None:
-        """Kalshi's mutually_exclusive flag means *at most* one wins. A basket
-        needs exactly one, which also requires at least one."""
+    def test_a_categorical_set_may_be_proposed_for_review(self) -> None:
+        """Proposing is not approving. Routing an unanswerable question to the
+        person whose job it is beats answering it wrongly in either
+        direction."""
         legs = [market(f"C{i}", "custom") for i in range(5)]
-        assert classify_event(event(exclusive=True), legs).verdict is StructuralVerdict.ENUMERATED
+        assert classify_event(event(exclusive=True), legs).may_propose
+
+    def test_machine_coverage_checking_does_not_apply(self) -> None:
+        """There are no strikes to tile. Reporting "covered" would be a
+        verification that verified nothing, and a reviewer would read it as
+        the machine having confirmed exhaustiveness."""
+        legs = [market(f"C{i}", "custom") for i in range(5)]
+        verdict = classify_event(event(exclusive=True), legs).verdict
+        assert verdict.coverage_is_checkable is False
+        assert StructuralVerdict.PARTITION.coverage_is_checkable is True
 
 
 class TestIncompleteCoverage:
@@ -122,9 +143,11 @@ class TestRejections:
 
 
 class TestVerdictPolicy:
-    def test_only_partitions_may_be_proposed(self) -> None:
+    def test_only_shaped_sets_may_be_proposed(self) -> None:
+        """Numeric partitions and categorical sets, and nothing else. An
+        open-ended or mixed set is not a basket in any reading."""
         proposable = {v for v in StructuralVerdict if v.may_propose}
-        assert proposable == {StructuralVerdict.PARTITION}
+        assert proposable == {StructuralVerdict.PARTITION, StructuralVerdict.CATEGORICAL}
 
     @pytest.mark.parametrize("verdict", list(StructuralVerdict))
     def test_every_verdict_is_documented(self, verdict: StructuralVerdict) -> None:

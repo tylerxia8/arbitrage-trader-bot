@@ -47,3 +47,6 @@ requirements.lock.txt
 
 # run logs: evidence lives in the archive, not in scrollback
 *.log
+
+# scratch probes
+.scratch/

@@ -41,7 +41,7 @@ PARTITION = [
     market("T100", strike_type="greater", floor="100"),
 ]
 
-ENUMERATED = [
+CATEGORICAL = [
     {"ticker": f"KXTEST-26AUG14-{n}", "status": "active", "strike_type": "custom"}
     for n in ("ALICE", "BOB", "CAROL")
 ]
@@ -120,14 +120,14 @@ class TestPricing:
 
 
 class TestStructuralRefusals:
-    async def test_a_non_partition_is_not_priced(self) -> None:
-        """Named candidates from an unbounded space are mutually exclusive and
-        not collectively exhaustive; summing them is not a basket price."""
-        async with venue(ENUMERATED) as client:
+    async def test_a_categorical_set_is_now_surveyed(self) -> None:
+        """The sweep used to skip these, which is how a five-outcome Fed basket
+        at ninety cents went unseen across eleven thousand events."""
+        async with venue(CATEGORICAL) as client:
             report = await survey_venue(client)
 
-        assert report.priced == []
-        assert report.skipped_structure == 1
+        assert report.skipped_structure == 0
+        assert len(report.structures) == 1
 
     async def test_buckets_with_a_hole_are_not_priced(self) -> None:
         """A set with a gap produces a discount that is really a missing
@@ -302,8 +302,11 @@ class TestReport:
         assert "One moment per event" in rendered
         assert "candidate for collection, not for trading" in rendered
 
-    async def test_an_empty_venue_says_so(self) -> None:
-        async with venue(ENUMERATED) as client:
+    async def test_a_venue_with_nothing_priceable_says_so(self) -> None:
+        """A categorical set no longer stands in for "unpriceable" -- those are
+        surveyed now. A two-outcome event genuinely is not a basket."""
+        too_few = [market("A", strike_type="less", cap="99")]
+        async with venue(too_few) as client:
             rendered = (await survey_venue(client)).render()
         assert "Nothing on this venue priced" in rendered
 

@@ -318,10 +318,15 @@ def _absorb(
         series_ticker = str(event.get("series_ticker") or "")
         seen_series.add(series_ticker)
         markets = [m for m in event.get("markets") or [] if m.get("status") == "active"]
-        if not classify_event(event, markets).may_propose:
+        structure = classify_event(event, markets)
+        if not structure.may_propose:
             report.skipped_structure += 1
             continue
-        if not check_integer_coverage(markets).covered:
+        # Coverage is only checkable where there are strikes to tile. A
+        # categorical set has none, and running the check on it would reject
+        # every one of them -- which is precisely how a five-outcome Fed basket
+        # at ninety cents stayed invisible across eleven thousand events.
+        if structure.verdict.coverage_is_checkable and not check_integer_coverage(markets).covered:
             report.skipped_coverage += 1
             continue
         candidates.append((event, markets))

@@ -54,9 +54,26 @@ class StructuralVerdict(enum.StrEnum):
     """Numeric buckets with both tails. A candidate for human review -- the
     only verdict that may be proposed to the registry."""
 
-    ENUMERATED = "enumerated"
-    """Named candidates from an unbounded space. Mutually exclusive but not
-    exhaustive; the apparent discount is the price of the missing outcomes."""
+    CATEGORICAL = "categorical"
+    """Mutually exclusive **named** outcomes, where whether they exhaust the
+    space is a question about the world rather than about the data.
+
+    This verdict replaced one called ``enumerated``, which asserted that named
+    outcomes are never collectively exhaustive and dismissed them. That is true
+    of "who will be the nominee", where the field of possible people is open,
+    and false of "cut / hold / hike", where the taxonomy is closed -- and the
+    venue describes both identically, as ``custom`` strike types on an
+    exclusive event. Nothing in the payload distinguishes them.
+
+    Dismissing the whole class cost this project a real opportunity: a
+    five-outcome Fed decision basket trading at ninety cents for a guaranteed
+    dollar, five hundred contracts deep, which the venue-wide sweep skipped
+    because it looked like a list of candidates.
+
+    So the machine stops guessing and routes the question to the person whose
+    job it already is. A categorical set may be *proposed*; its coverage is
+    recorded as unverified, and no coverage check pretends otherwise.
+    """
 
     OPEN_ENDED = "open_ended"
     """Numeric buckets missing a tail, so values beyond the last bucket
@@ -70,13 +87,25 @@ class StructuralVerdict(enum.StrEnum):
     """Fewer outcomes than a basket needs."""
 
     @property
+    def coverage_is_checkable(self) -> bool:
+        """Whether machine coverage checking (FR-008) means anything here.
+
+        Only for numeric buckets. A categorical set has no strikes to tile, so
+        running the integer check on it and reporting "covered" would be a
+        verification that verified nothing.
+        """
+        return self is StructuralVerdict.PARTITION
+
+    @property
     def may_propose(self) -> bool:
         """Whether a candidate may be drafted from this set.
 
         Proposing is not approving. A drafted relationship enters the registry
-        as PENDING and cannot qualify anything until a person signs for it.
+        as PENDING and cannot qualify anything until a person signs for it --
+        which is exactly why a categorical set belongs here rather than being
+        dismissed: the question it raises is one only a person can answer.
         """
-        return self is StructuralVerdict.PARTITION
+        return self in (StructuralVerdict.PARTITION, StructuralVerdict.CATEGORICAL)
 
 
 @dataclass(frozen=True, slots=True)
@@ -120,8 +149,9 @@ def classify_event(
 
     if types <= {"custom"}:
         return structure(
-            StructuralVerdict.ENUMERATED,
-            "named candidates from an unbounded space; not collectively exhaustive",
+            StructuralVerdict.CATEGORICAL,
+            "exclusive named outcomes; whether they exhaust the space cannot be read "
+            "from the payload and must be confirmed against the settlement terms",
         )
 
     if not types <= NUMERIC_STRIKE_TYPES:

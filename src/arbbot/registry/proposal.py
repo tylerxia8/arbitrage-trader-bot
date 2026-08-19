@@ -44,7 +44,11 @@ from arbbot.db.models import RelationshipRecord
 from arbbot.normalize.terms import normalize_kalshi_market
 from arbbot.registry.service import RegistryError, RelationshipRegistry
 from arbbot.relationships import RelationshipStatus, RelationshipType
-from arbbot.venues.kalshi.discovery import check_integer_coverage, classify_event
+from arbbot.venues.kalshi.discovery import (
+    CoverageReport,
+    check_integer_coverage,
+    classify_event,
+)
 
 __all__ = [
     "ProposalOutcome",
@@ -218,7 +222,11 @@ def _leg_definitions(markets: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 def _payout_proof(
-    event: dict[str, Any], markets: list[dict[str, Any]], coverage_summary: str
+    event: dict[str, Any],
+    markets: list[dict[str, Any]],
+    coverage_summary: str,
+    *,
+    machine_checked: bool = True,
 ) -> dict[str, Any]:
     """The case the reviewer is being asked to accept, not just its conclusion."""
     return {
@@ -232,7 +240,9 @@ def _payout_proof(
         # only the date and the strikes.
         "rules_templates": review_templates(markets),
         "event_title": event.get("title"),
-        "structure": "numeric buckets with both tails",
+        "structure": (
+            "numeric buckets with both tails" if machine_checked else "exclusive named outcomes"
+        ),
         "integer_coverage": coverage_summary,
         "boundaries": [
             {
@@ -244,8 +254,14 @@ def _payout_proof(
             }
             for m in markets
         ],
+        "coverage_machine_checked": machine_checked,
         "reviewer_must_confirm": [
-            "the buckets leave no possible outcome unresolved and none overlapping",
+            (
+                "the buckets leave no possible outcome unresolved and none overlapping"
+                if machine_checked
+                else "THAT NO POSSIBLE RESULT FALLS OUTSIDE THIS LIST -- nothing has "
+                "checked this, and a set missing one outcome pays nothing when it occurs"
+            ),
             "every leg settles from the same source, report and time",
             "no leg can settle YES alongside another",
         ],
@@ -277,8 +293,23 @@ def propose_from_events(
             )
             continue
 
-        coverage = check_integer_coverage(markets)
-        if not coverage.covered:
+        if not structure.verdict.coverage_is_checkable:
+            # A categorical set has no strikes to tile. Running the integer
+            # check here and reporting "covered" would be a verification that
+            # verified nothing, which is worse than none at all -- a reviewer
+            # would read it as the machine having confirmed exhaustiveness.
+            coverage = CoverageReport(
+                covered=False,
+                problems=(
+                    "not machine-checkable: these are named outcomes, so whether they "
+                    "exhaust the space is a question about the world and not about the "
+                    "strikes. A reviewer must confirm no possible result falls outside "
+                    "this list.",
+                ),
+            )
+        else:
+            coverage = check_integer_coverage(markets)
+        if structure.verdict.coverage_is_checkable and not coverage.covered:
             # A set with a hole is not a basket, and drafting it would put a
             # reviewer in the position of approving something this system
             # already knows is broken.
@@ -291,7 +322,12 @@ def propose_from_events(
             str(market["ticker"]): normalize_kalshi_market(market).terms_hash for market in markets
         }
 
-        proof = _payout_proof(event, markets, coverage.summary)
+        proof = _payout_proof(
+            event,
+            markets,
+            coverage.summary,
+            machine_checked=structure.verdict.coverage_is_checkable,
+        )
         existing = registry.latest(slug_for(ticker))
         if existing is not None and dict(existing.dependency_hashes) == hashes:
             detail = "leg set and terms match the latest version"
@@ -333,7 +369,11 @@ def propose_from_events(
 
         record = registry.draft(
             slug=slug_for(ticker),
-            relationship_type=RelationshipType.INTERVAL_PARTITION,
+            relationship_type=(
+                RelationshipType.INTERVAL_PARTITION
+                if structure.verdict.coverage_is_checkable
+                else RelationshipType.EXHAUSTIVE_BASKET
+            ),
             legs=_leg_definitions(markets),
             payout_proof=proof,
             dependency_hashes=hashes,

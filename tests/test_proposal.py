@@ -137,18 +137,39 @@ class TestRefusals:
         assert report.drafted == []
         assert pending(session) == []
 
-    def test_a_non_partition_is_not_drafted(self, session: Session) -> None:
-        """Named candidates from an unbounded space are mutually exclusive and
-        not collectively exhaustive -- the difference that decides whether a
-        basket pays a dollar."""
-        enumerated = [
+    def test_a_categorical_set_is_drafted_with_coverage_unverified(self, session: Session) -> None:
+        """It used to be dismissed. That was right for an open field of
+        candidates and wrong for a closed taxonomy, and the payload cannot tell
+        them apart -- so it is drafted, and the draft says plainly that nothing
+        checked exhaustiveness."""
+        categorical = [
             {"ticker": f"{EVENT_TICKER}-{name}", "status": "active", "strike_type": "custom"}
-            for name in ("ALICE", "BOB", "CAROL")
+            for name in ("CUT", "HOLD", "HIKE")
         ]
-        report = propose_from_events(session, [event(enumerated)])
+        report = propose_from_events(session, [event(categorical)])
 
-        assert report.drafted == []
-        assert all(o.action == "skipped" for o in report.outcomes)
+        assert len(report.drafted) == 1
+        record = RelationshipRegistry(session).latest(slug_for(EVENT_TICKER))
+        assert record is not None
+        proof = dict(record.payout_proof)
+        assert proof["coverage_machine_checked"] is False
+        assert "not machine-checkable" in proof["integer_coverage"]
+
+    def test_the_reviewer_is_asked_the_question_only_they_can_answer(
+        self, session: Session
+    ) -> None:
+        """A set missing one outcome pays nothing when it occurs, and no
+        machine check stands between the reviewer and that."""
+        categorical = [
+            {"ticker": f"{EVENT_TICKER}-{name}", "status": "active", "strike_type": "custom"}
+            for name in ("CUT", "HOLD", "HIKE")
+        ]
+        propose_from_events(session, [event(categorical)])
+        record = RelationshipRegistry(session).latest(slug_for(EVENT_TICKER))
+
+        assert record is not None
+        confirms = dict(record.payout_proof)["reviewer_must_confirm"]
+        assert any("NO POSSIBLE RESULT FALLS OUTSIDE" in c for c in confirms)
 
 
 class TestIdempotence:
