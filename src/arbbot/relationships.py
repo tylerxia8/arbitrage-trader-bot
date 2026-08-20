@@ -31,6 +31,17 @@ class RelationshipType(enum.StrEnum):
     INTERVAL_PARTITION = "interval_partition"
     """Non-overlapping intervals covering every possible result."""
 
+    CROSS_VENUE_PAIR = "cross_venue_pair"
+    """The same claim on two venues; YES on one plus NO on the other.
+
+    Structurally the simplest relationship here -- two legs, and exactly one
+    pays a dollar. Practically the most dangerous, because the guarantee rests
+    entirely on the two venues resolving identically, and they publish their
+    settlement rules in different words written by different people. A pair
+    that diverges is not a smaller edge; it is an unhedged position on both
+    sides at once.
+    """
+
 
 class RelationshipStatus(enum.StrEnum):
     """Lifecycle of a registry entry."""

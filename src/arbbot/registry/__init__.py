@@ -2,6 +2,12 @@
 
 from __future__ import annotations
 
+from arbbot.registry.crossvenue import (
+    CrossVenueCandidate,
+    find_candidates,
+    propose_pairs,
+    similarity,
+)
 from arbbot.registry.proposal import (
     ProposalOutcome,
     ProposalReport,
@@ -18,18 +24,22 @@ from arbbot.registry.proposal import (
 from arbbot.registry.service import RegistryError, RelationshipRegistry, UsabilityCheck
 
 __all__ = [
+    "CrossVenueCandidate",
     "ProposalOutcome",
     "ProposalReport",
     "RegistryError",
     "RelationshipRegistry",
     "UsabilityCheck",
     "approve_group",
+    "find_candidates",
     "fingerprint_of",
     "group_pending",
     "pending",
     "propose_from_events",
+    "propose_pairs",
     "review_fingerprint",
     "review_templates",
     "rules_template",
+    "similarity",
     "slug_for",
 ]
