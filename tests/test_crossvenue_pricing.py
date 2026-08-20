@@ -149,10 +149,10 @@ class TestReport:
         assert "no approved relationship" in rendered
         assert "a cheap row is a question" in rendered
 
-    def test_nothing_positive_says_so_plainly(self) -> None:
+    def test_nothing_credible_says_so_plainly(self) -> None:
         dear = quote(kalshi_ask="0.60", other_bid="0.30")
         rendered = CrossVenueReport(quotes=[dear], priced_at=NOW).render()
-        assert "No pair covers its Kalshi fee" in rendered
+        assert "No pair both covers its Kalshi fee" in rendered
 
     def test_rows_are_ordered_by_rate_not_by_edge(self) -> None:
         """Absolute edge is what misled the first probe."""
@@ -161,3 +161,43 @@ class TestReport:
         rendered = CrossVenueReport(quotes=[later, soon], priced_at=NOW).render()
 
         assert rendered.index("30") < rendered.index("880")
+
+
+class TestDivergence:
+    """A wide gap between two venues is evidence of a mismatched claim.
+
+    A short-dated sweep produced forty-three "positive" pairs led by one
+    costing eighteen cents for a guaranteed dollar. It had matched Kalshi's
+    national House-control market against Polymarket's IN-08 district market:
+    both say Republican Party, House and win. The wider the gap, the better the
+    arithmetic looks, so the worst pairs sort to the top of any report ordered
+    by edge.
+    """
+
+    def test_the_national_versus_district_pairing_is_flagged(self) -> None:
+        q = quote(kalshi_ask="0.15", other_bid="0.967", resolves=NOW + dt.timedelta(days=74))
+        assert q.divergence > D("0.8")
+        assert q.suspect is True
+
+    def test_a_pair_within_a_spread_is_not_flagged(self) -> None:
+        """Venues quoting the same event differ by a spread and a little noise."""
+        q = quote(kalshi_ask="0.096", other_bid="0.129")
+        assert q.divergence == D("0.033")
+        assert q.suspect is False
+
+    def test_mismatched_rows_are_separated_from_credible_ones(self) -> None:
+        good = quote(kalshi_ask="0.096", other_bid="0.129")
+        bad = quote(kalshi_ask="0.15", other_bid="0.967", resolves=NOW + dt.timedelta(days=74))
+        report = CrossVenueReport(quotes=[bad, good], priced_at=NOW)
+
+        assert report.mismatched == [bad]
+        assert report.credible == [good]
+
+    def test_a_mismatched_row_never_reaches_the_opportunity_table(self) -> None:
+        """It would otherwise sort first, being the most attractive number."""
+        bad = quote(kalshi_ask="0.15", other_bid="0.967", resolves=NOW + dt.timedelta(days=74))
+        rendered = CrossVenueReport(quotes=[bad], priced_at=NOW).render()
+
+        assert "PROBABLY NOT THE SAME CLAIM" in rendered
+        assert "per year" not in rendered
+        assert "national House control" in rendered

@@ -89,6 +89,28 @@ class CrossVenueQuote:
         return quantize_cost(self.gross_edge * self.quantity - self.kalshi_fee)
 
     @property
+    def divergence(self) -> Decimal:
+        """How far apart the two venues price the same claim.
+
+        Both sides expressed as a YES probability. Venues quoting genuinely the
+        same event differ by a spread and a little noise. A gap of tens of
+        points is not an inefficiency somebody left lying about -- it is two
+        different questions.
+        """
+        other_yes = PAYOUT_DOLLARS - self.other_no_ask
+        return abs(self.kalshi_yes_ask - other_yes)
+
+    @property
+    def suspect(self) -> bool:
+        """Whether the gap is better explained by a mismatch than an edge.
+
+        Fifteen points is far outside any spread either venue quotes and far
+        inside the gaps mismatched pairs produce: the national-House-control
+        against IN-08-district pairing that prompted this measured eighty-two.
+        """
+        return self.divergence > Decimal("0.15")
+
+    @property
     def capital(self) -> Decimal:
         return quantize_cost(self.cost * self.quantity)
 
@@ -123,6 +145,15 @@ class CrossVenueReport:
     def positive(self) -> list[CrossVenueQuote]:
         return [q for q in self.quotes if q.net_edge > ZERO]
 
+    @property
+    def credible(self) -> list[CrossVenueQuote]:
+        """Positive, and not obviously a pair of different questions."""
+        return [q for q in self.positive if not q.suspect]
+
+    @property
+    def mismatched(self) -> list[CrossVenueQuote]:
+        return [q for q in self.positive if q.suspect]
+
     def render(self, limit: int = 20) -> str:
         now = self.priced_at or dt.datetime.now(dt.UTC)
         lines = [
@@ -131,15 +162,32 @@ class CrossVenueReport:
             f"positive after Kalshi fees : {len(self.positive)}",
             f"approved for trading  : {sum(1 for q in self.quotes if q.approved)}",
         ]
-        if not self.positive:
+        lines.append(f"  probably mismatched : {len(self.mismatched)}")
+        lines.append(f"  credible            : {len(self.credible)}")
+
+        if self.mismatched:
             lines.append("")
-            lines.append("No pair covers its Kalshi fee, let alone the other venue's.")
+            lines.append("PROBABLY NOT THE SAME CLAIM -- the two venues disagree too much:")
+            lines.append(f"  {'pair':<44} {'cost':>8} {'gap':>7}")
+            lines.append("  " + "-" * 62)
+            for q in sorted(self.mismatched, key=lambda q: -q.divergence)[:8]:
+                lines.append(f"  {q.question[:43]:<44} ${q.cost:>7} {q.divergence:>6.0%}")
+            lines.append("")
+            lines.append("  Venues quoting the same event differ by a spread, not by tens of")
+            lines.append("  points. The wider the gap the better the arithmetic looks, so the")
+            lines.append("  worst pairs sort to the top of any report ordered by edge -- one")
+            lines.append("  of these matched national House control against one district.")
+
+        if not self.credible:
+            lines.append("")
+            lines.append("No pair both covers its Kalshi fee and prices consistently across")
+            lines.append("the two venues.")
             return "\n".join(lines)
 
         lines.append("")
         lines.append(f"  {'pair':<40} {'cost':>8} {'net':>9} {'days':>6} {'per year':>9}")
         lines.append("  " + "-" * 78)
-        for q in sorted(self.positive, key=lambda q: -(q.annualised(now) or ZERO))[:limit]:
+        for q in sorted(self.credible, key=lambda q: -(q.annualised(now) or ZERO))[:limit]:
             rate = q.annualised(now)
             days = q.days_to_resolution(now)
             lines.append(
@@ -158,7 +206,7 @@ class CrossVenueReport:
         lines.append("fee schedule is in units this project has not verified, so every")
         lines.append("figure above is an upper bound on the edge.")
         lines.append("")
-        unapproved = [q for q in self.positive if not q.approved]
+        unapproved = [q for q in self.credible if not q.approved]
         if unapproved:
             lines.append(f"{len(unapproved)} of these have no approved relationship behind them.")
             lines.append("A price is a guaranteed dollar only if both contracts settle on the")
