@@ -13,7 +13,7 @@ from typing import Any
 
 import httpx
 
-from arbbot.analysis.survey import survey_venue
+from arbbot.analysis.survey import EventPricing, SurveyReport, survey_venue
 from arbbot.venues.kalshi.rest import KalshiRestClient
 
 D = Decimal
@@ -323,3 +323,61 @@ class TestReport:
         assert len(report.series_errors) == 1
         assert "page 0" in report.series_errors[0]
         assert report.priced == []
+
+
+class TestSuspectCategoricalSets:
+    """Cheapness in a named-outcome set is evidence of a missing outcome.
+
+    Correcting the classifier to stop dismissing categorical sets swapped which
+    error it made. The old rule was right about candidate lists -- eleven names
+    for the Hungarian presidency summing to twenty cents is the market pricing
+    "somebody unlisted" at eighty percent, not an eighty percent edge -- and the
+    new one had no way to say so. This is the diagnostic that separates them.
+    """
+
+    def pricing(self, taker: str, maker: str, *, categorical: bool) -> EventPricing:
+        return EventPricing(
+            event_ticker="KXTEST-1",
+            series="KXTEST",
+            title="t",
+            legs=11,
+            taker_cost=D(taker),
+            maker_cost=D(maker),
+            min_depth=D("100"),
+            leg_spread=dt.timedelta(seconds=1),
+            categorical=categorical,
+        )
+
+    def test_a_cheap_candidate_list_is_flagged(self) -> None:
+        p = self.pricing("0.20", "0.16", categorical=True)
+        assert p.implied_missing == D("0.82")
+        assert p.suspect is True
+
+    def test_a_closed_taxonomy_near_par_is_not(self) -> None:
+        """The Fed case: five outcomes at ninety cents with a seven cent
+        spread leaves little on "none of the above"."""
+        p = self.pricing("0.90", "0.83", categorical=True)
+        assert p.implied_missing == D("0.135")
+        assert p.suspect is True, "still worth a reviewer's eye at 13%"
+
+    def test_a_tight_categorical_set_passes(self) -> None:
+        p = self.pricing("0.99", "0.98", categorical=True)
+        assert p.suspect is False
+
+    def test_a_numeric_partition_is_never_suspect(self) -> None:
+        """Its coverage was machine-checked, so cheap is cheap for a reason
+        worth looking at rather than a missing leg."""
+        p = self.pricing("0.20", "0.16", categorical=False)
+        assert p.suspect is False
+
+    def test_the_report_separates_them(self) -> None:
+        report = SurveyReport(
+            priced=[
+                self.pricing("0.20", "0.16", categorical=True),
+                self.pricing("0.99", "0.98", categorical=True),
+            ]
+        )
+        rendered = report.render()
+        assert "PROBABLY NOT EXHAUSTIVE" in rendered
+        assert "probably incomplete     : 1" in rendered
+        assert "credible                         : 1" in rendered

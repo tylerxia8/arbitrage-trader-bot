@@ -69,6 +69,9 @@ class StructureFinding:
     series: str
     title: str
     legs: int
+    categorical: bool = False
+    """Named outcomes rather than numeric buckets, so nothing has checked --
+    or can check -- that they exhaust the space."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -88,6 +91,36 @@ class EventPricing:
     min_depth: Decimal
     leg_spread: dt.timedelta
     """How long the whole event took to fetch. Evidence the sum is a moment."""
+
+    categorical: bool = False
+
+    @property
+    def implied_missing(self) -> Decimal:
+        """What the market pays for "none of the listed outcomes".
+
+        Taken at the midpoint, so the bid-ask spread is not mistaken for a
+        missing outcome. For a set that genuinely exhausts its space this is
+        near zero; the further above zero it sits, the more the market is
+        saying that the true result is not on the list.
+
+        This is the number that tells a cheap categorical basket apart from an
+        opportunity. Eleven named candidates for the Hungarian presidency
+        summed to twenty cents, which reads as an eighty percent edge and is
+        really the market pricing "somebody else wins" at eighty percent.
+        Buying all eleven buys a one-in-five chance, not a dollar.
+        """
+        mid = (self.taker_cost + self.maker_cost) / 2
+        return PAYOUT_DOLLARS - mid
+
+    @property
+    def suspect(self) -> bool:
+        """Whether cheapness here is more likely a missing outcome than an edge.
+
+        Only meaningful for categorical sets: numeric buckets have had their
+        coverage machine-checked, so a cheap one is cheap for a reason worth
+        looking at.
+        """
+        return self.categorical and self.implied_missing > Decimal("0.05")
 
     @property
     def taker_edge(self) -> Decimal:
@@ -170,9 +203,32 @@ class SurveyReport:
             lines.append("Nothing on this venue priced as a complete, verified partition.")
             return "\n".join(lines)
 
+        suspect = [p for p in self.priced if p.suspect]
+        credible = [p for p in self.taker_positive if not p.suspect]
+
         lines.append("")
         lines.append(f"below a dollar crossing the spread : {len(self.taker_positive)}")
+        lines.append(f"  of which probably incomplete     : {len(suspect)}")
+        lines.append(f"  credible                         : {len(credible)}")
         lines.append(f"below a dollar resting at the bid  : {len(self.maker_positive)}")
+
+        if suspect:
+            lines.append("")
+            lines.append("PROBABLY NOT EXHAUSTIVE -- cheap because an outcome is missing:")
+            lines.append(f"  {'event':<30} {'legs':>4} {'taker':>9} {'none-of-these':>14}")
+            lines.append("  " + "-" * 62)
+            for p in sorted(suspect, key=lambda p: -p.implied_missing)[:10]:
+                lines.append(
+                    f"  {p.event_ticker:<30} {p.legs:>4} ${p.taker_cost:>8} "
+                    f"{p.implied_missing:>13.0%}"
+                )
+            lines.append("")
+            lines.append('  Named-outcome sets whose midpoint leaves real money on "none of')
+            lines.append('  the above". Eleven candidates for the Hungarian presidency sum to')
+            lines.append("  twenty cents; that is not an eighty percent edge, it is the market")
+            lines.append("  pricing somebody unlisted at eighty percent. Buying the set buys a")
+            lines.append("  one-in-five chance, not a dollar.")
+            lines.append("  buys a one-in-five chance, not a dollar.")
 
         lines.append("")
         lines.append("cheapest partitions on the venue, by what crossing the spread costs:")
@@ -336,6 +392,7 @@ def _absorb(
                 series=series_ticker,
                 title=str(event.get("title", "")),
                 legs=len(markets),
+                categorical=not structure.verdict.coverage_is_checkable,
             )
         )
 
@@ -401,6 +458,10 @@ async def _price(
 
         report.priced.append(
             EventPricing(
+                categorical=any(
+                    s.event_ticker == str(event.get("event_ticker", "")) and s.categorical
+                    for s in report.structures
+                ),
                 event_ticker=str(event.get("event_ticker", "")),
                 series=str(event.get("series_ticker", "")),
                 title=str(event.get("title", "")),
