@@ -16,8 +16,8 @@ from typing import Any
 import httpx
 import pytest
 
+from arbbot.venues.http import _BACKOFF_BASE_SECONDS
 from arbbot.venues.kalshi.rest import (
-    _BACKOFF_BASE_SECONDS,
     PRODUCTION_REST_BASE,
     KalshiRestClient,
     RateLimiter,
@@ -85,7 +85,7 @@ class TestRetries:
         async def no_sleep(seconds: float) -> None:
             slept.append(seconds)
 
-        monkeypatch.setattr("arbbot.venues.kalshi.rest.asyncio.sleep", no_sleep)
+        monkeypatch.setattr("arbbot.venues.http.asyncio.sleep", no_sleep)
         attempts = 0
 
         def handler(_request: httpx.Request) -> httpx.Response:
@@ -109,7 +109,7 @@ class TestRetries:
         async def no_sleep(seconds: float) -> None:
             slept.append(seconds)
 
-        monkeypatch.setattr("arbbot.venues.kalshi.rest.asyncio.sleep", no_sleep)
+        monkeypatch.setattr("arbbot.venues.http.asyncio.sleep", no_sleep)
         attempts = 0
 
         def handler(_request: httpx.Request) -> httpx.Response:
@@ -133,7 +133,7 @@ class TestRetries:
         async def no_sleep(_seconds: float) -> None:
             return None
 
-        monkeypatch.setattr("arbbot.venues.kalshi.rest.asyncio.sleep", no_sleep)
+        monkeypatch.setattr("arbbot.venues.http.asyncio.sleep", no_sleep)
         attempts = 0
 
         def handler(_request: httpx.Request) -> httpx.Response:
@@ -152,7 +152,7 @@ class TestRetries:
         async def no_sleep(_seconds: float) -> None:
             return None
 
-        monkeypatch.setattr("arbbot.venues.kalshi.rest.asyncio.sleep", no_sleep)
+        monkeypatch.setattr("arbbot.venues.http.asyncio.sleep", no_sleep)
 
         def handler(_request: httpx.Request) -> httpx.Response:
             return httpx.Response(429)
@@ -314,7 +314,7 @@ class TestRateLimiter:
         async def record(seconds: float) -> None:
             slept.append(seconds)
 
-        monkeypatch.setattr("arbbot.venues.kalshi.rest.asyncio.sleep", record)
+        monkeypatch.setattr("arbbot.venues.http.asyncio.sleep", record)
         limiter = RateLimiter(requests_per_second=2)
 
         await limiter.acquire()
